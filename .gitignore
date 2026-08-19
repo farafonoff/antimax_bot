@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+.venv/
+venv/
+
+# Local secrets (keep .env.example committed)
+.env
+.env.local
+.env.*.local
+
+# Runtime state
+cache/
+data/
+*.db

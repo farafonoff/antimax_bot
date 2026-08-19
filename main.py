@@ -1,0 +1,193 @@
+import asyncio
+import os
+import signal
+import sys
+
+from aiogram import Bot
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.types import ChatMemberUpdated, Message
+
+from app.config import load_settings
+from app.context import Context
+from app.db import LinksDB
+from app.logger import log
+from app.max_client import build_max_client
+from app.sms_provider import SmsInbox
+from app.tg_bot import build_dispatcher
+
+
+def _ensure_dirs(settings):
+    os.makedirs(settings.max_work_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(settings.db_path) or ".", exist_ok=True)
+
+
+async def run_max(ctx: Context) -> None:
+    client = ctx.max_client
+    try:
+        await client.start()
+    except Exception as exc:  # noqa: BLE001
+        log.exception("MAX client crashed: %s", exc)
+
+
+async def run_tg(ctx: Context) -> None:
+    ctx.bot_id = (await ctx.bot.me()).id
+    dp = build_dispatcher(ctx)
+    try:
+        # handle_signals=False: we manage SIGINT/SIGTERM in main() so that BOTH
+        # the MAX client and Telegram polling are shut down together.
+        await dp.start_polling(ctx.bot, handle_signals=False)
+    except (Exception, asyncio.CancelledError):  # noqa: BLE001
+        log.debug("Telegram polling stopped")
+
+
+async def main() -> None:
+    settings = load_settings()
+    _ensure_dirs(settings)
+
+    db = LinksDB(settings.db_path)
+    sms = SmsInbox()
+    bot = Bot(
+        token=settings.telegram_bot_token,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+    ctx = Context(settings=settings, bot=bot, db=db, sms=sms)
+
+    max_client = build_max_client(ctx)
+    ctx.max_client = max_client
+
+    print("=" * 60)
+    print("AntiBridge (MAX <-> Telegram) starting...")
+    print(f"Group: {ctx.group_id} | Owner: {ctx.owner_id}")
+    print("If MAX asks for an SMS code, run:  /sms <code>   in your Telegram group.")
+    print("=" * 60)
+    log.info("Starting MAX + Telegram bridge")
+
+    max_task = asyncio.create_task(run_max(ctx))
+    tg_task = asyncio.create_task(run_tg(ctx))
+    tasks = (max_task, tg_task)
+
+    loop = asyncio.get_running_loop()
+
+    def _request_stop(*_):
+        log.info("Shutdown requested (Ctrl+C)")
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _request_stop)
+        except NotImplementedError:
+            pass  # non-Unix
+
+    try:
+        await asyncio.gather(*tasks)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await ctx.max_client.close()
+        except Exception:  # noqa: BLE001
+            pass
+        await ctx.bot.session.close()
+        log.info("Shutdown complete.")
+
+
+if __name__ == "__main__":
+    if "--tg-only" in sys.argv:
+        s = load_settings()
+        _ensure_dirs(s)
+        db = LinksDB(s.db_path)
+        sms = SmsInbox()
+        bot = Bot(
+            token=s.telegram_bot_token,
+            default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+        )
+        ctx = Context(settings=s, bot=bot, db=db, sms=sms)
+        ctx.max_client = None  # MAX is NOT started -> no SMS is requested
+        dp = build_dispatcher(ctx)
+
+        @dp.my_chat_member()
+        async def _on_added(event: ChatMemberUpdated) -> None:
+            new = event.new_chat_member
+            if new and new.status in ("member", "administrator", "creator"):
+                print(
+                    f"[TG] Bot added to chat: chat_id={event.chat.id} "
+                    f"title={event.chat.title!r} forum={getattr(event.chat, 'is_forum', None)} "
+                    f"status={new.status}",
+                    flush=True,
+                )
+
+        @dp.message()
+        async def _debug_incoming(message: Message) -> None:
+            if message.from_user and ctx.bot_id and message.from_user.id == ctx.bot_id:
+                return
+            tid = message.message_thread_id
+            print(
+                f"[TG] chat_id={message.chat.id} thread_id={tid} "
+                f"from={message.from_user.id if message.from_user else '-'} "
+                f"text={message.text!r}",
+                flush=True,
+            )
+
+        async def _tg_only_main() -> None:
+            me = await bot.me()
+            ctx.bot_id = me.id
+            print(
+                "TG-ONLY mode (MAX auth is OFF; no SMS will be sent).\n"
+                "1) Add @%s to your forum supergroup as ADMIN "
+                "(Create topics + Read messages + Post messages).\n"
+                "2) Send any message in the group.\n"
+                "3) Copy the printed 'chat_id' into .env -> TELEGRAM_GROUP_ID, then run ./run.sh."
+                % me.username,
+                flush=True,
+            )
+            await dp.start_polling(bot)
+
+        try:
+            asyncio.run(_tg_only_main())
+        except KeyboardInterrupt:
+            print("\nStopped.", flush=True)
+        sys.exit(0)
+
+    if "--check" in sys.argv:
+        s = load_settings()
+        _ensure_dirs(s)
+        b = Bot(token=s.telegram_bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
+        async def _diag() -> None:
+            try:
+                me = await b.me()
+                print(f"Telegram bot: {me.username} (id={me.id})")
+                try:
+                    chat = await b.get_chat(s.telegram_group_id)
+                    print(f"Group {s.telegram_group_id}: type={chat.type} "
+                          f"is_forum={getattr(chat, 'is_forum', None)} "
+                          f"title={chat.title}")
+                    try:
+                        member = await b.get_chat_member(s.telegram_group_id, me.id)
+                        print(f"Bot in group: status={member.status} "
+                              f"can_post={getattr(member,'can_post_messages',None)} "
+                              f"can_create_topics={getattr(member,'can_create_topics',None)}")
+                    except Exception as e:  # noqa: BLE001
+                        print(f"Bot NOT in group / no rights: {e}")
+                except Exception as e:  # noqa: BLE001
+                    print(f"get_chat({s.telegram_group_id}) failed: {e}")
+            finally:
+                await b.session.close()
+
+        asyncio.run(_diag())
+        print("CHECK_OK: wiring valid (MAX auth is NOT triggered in --check).")
+        sys.exit(0)
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        log.info("Shutting down.")
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Fatal: %s", exc)
+        sys.exit(1)

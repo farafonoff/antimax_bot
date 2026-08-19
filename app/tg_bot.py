@@ -1,0 +1,326 @@
+from aiogram import Bot, Dispatcher, F
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.types import Message
+
+from pymax import Photo, Video, Voice, File
+
+from app.context import Context
+from app.logger import log
+
+
+def _is_owner(message: Message, ctx: Context) -> bool:
+    return message.from_user is not None and message.from_user.id == ctx.owner_id
+
+
+def _in_group(message: Message, ctx: Context) -> bool:
+    return message.chat is not None and message.chat.id == ctx.group_id
+
+
+def _real_topic(message: Message, ctx: Context):
+    """A true forum topic (not the General topic)."""
+    tid = message.message_thread_id
+    if tid is None or tid == ctx.group_id:
+        return None
+    return tid
+
+
+def build_dispatcher(ctx: Context) -> Dispatcher:
+    dp = Dispatcher()
+
+    @dp.message(Command(commands=["start", "help"]))
+    async def _cmd_help(message: Message) -> None:
+        if not (_in_group(message, ctx) and _is_owner(message, ctx)):
+            return
+        txt = (
+            "🔗 <b>MAX ↔ Telegram bridge</b>\n\n"
+            "Все сообщения из MAX чатов приходят сюда в темы автоматически "
+            "(первое сообщение создаёт тему).\n\n"
+            "<b>Команды (только для владельца):</b>\n"
+            "/max chats — список MAX‑чатов и привязок\n"
+            "/presence [&lt;user_id&gt;] — статус одного/всех юзеров; "
+            "живая лента — в теме «MAX presence»\n"
+            "/topic &lt;max_id&gt; — создать тему и привязать к MAX‑чату\n"
+            "/link &lt;max_id&gt; — привязать текущую тему к MAX‑чату\n"
+            "/unlink — отвязать текущую тему\n"
+            "/status — статус MAX и привязок\n"
+            "/sms &lt;код&gt; — ввести код SMS для входа в MAX\n"
+            "Помощь для семьи: пишите в тему родителя — сообщение доставится в MAX.\n\n"
+            "<b>Восстановить привязку, если тема не создалась:</b>  /relink &lt;max_id&gt;\n"
+            "<b>Как узнать user_id:</b> в /max chats 👤 — личный чат (chat_id == user_id)."
+        )
+        await ctx.tg_reply(message, txt)
+
+    @dp.message(Command(commands=["status"]))
+    async def _cmd_status(message: Message) -> None:
+        if not (_is_owner(message, ctx) and _in_group(message, ctx)):
+            return
+        if ctx.max_client is None or not ctx.max_ready.is_set():
+            await ctx.tg_reply(message, "MAX: ⏳ не подключён (нужен /sms для входа).")
+            return
+        links = await ctx.db.alist_links()
+        await ctx.tg_reply(
+            message,
+            f"MAX: ✅ подключён ({ctx.max_owner_name}) | чатов: {len(ctx.max_chats)}\n"
+            f"Привязок: {len(links)}",
+        )
+
+    @dp.message(Command(commands=["sms"]))
+    async def _cmd_sms(message: Message) -> None:
+        if not (_is_owner(message, ctx) and _in_group(message, ctx)):
+            return
+        parts = message.text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await ctx.tg_reply(message, "Использование: <code>/sms &lt;код&gt;</code>")
+            return
+        await ctx.sms.set_code(parts[1].strip())
+        await ctx.tg_reply(message, "✅ Код передан MAX.")
+
+    @dp.message(Command(commands=["max"]))
+    async def _cmd_max_chats(message: Message) -> None:
+        if not (_is_owner(message, ctx) and _in_group(message, ctx)):
+            return
+        if not ctx.max_chats:
+            await ctx.load_max_chats()
+        links = await ctx.db.alist_links()
+        by_topic = {l["tg_topic_id"]: l for l in links}
+        if not ctx.max_chats and not links:
+            await ctx.tg_reply(message, "MAX чаты недоступны (возможно, не подключён).")
+            return
+        lines = ["<b>MAX чаты / привязки</b>:"]
+        chat_to_user = {str(c): u for u, c in ctx.dialog_user_to_chat.items()}
+        for cid, title in sorted(ctx.max_chats.items(), key=lambda kv: kv[1]):
+            is_1to1 = str(cid) in chat_to_user
+            match = next((l for l in links if str(l["max_chat_id"]) == str(cid)), None)
+            if match:
+                tag = f" 🔗 → тема {match['tg_topic_id']} «{match['name'] or ''}»"
+            else:
+                tag = " ⚪ (без темы)"
+            pres = ""
+            hint = ""
+            uid = chat_to_user.get(str(cid))
+            if uid is not None:
+                pres = ctx.with_presence(uid)
+                hint = f" | /presence {uid}"
+            lines.append(f"{'👤' if is_1to1 else '👥'} <code>{cid}</code> — {title}{pres}{tag}{hint}")
+        lines.append("")
+        lines.append("<i>👤 — личный чат (1:1); /presence &lt;user_id&gt; — статус контакта.</i>")
+        await ctx.tg_reply(message, "\n".join(lines))
+
+    @dp.message(Command(commands=["topic"]))
+    async def _cmd_topic(message: Message) -> None:
+        if not (_is_owner(message, ctx) and _in_group(message, ctx)):
+            return
+        parts = message.text.split(maxsplit=1)
+        if len(parts) < 2:
+            await ctx.tg_reply(message, "Использование: <code>/topic &lt;max_chat_id&gt;</code>")
+            return
+        if ctx.max_client is None or not ctx.max_ready.is_set():
+            await ctx.tg_reply(message, "MAX не подключён.")
+            return
+        max_id = parts[1].strip()
+        title = ctx.name_for(max_id, fallback=f"MAX chat {max_id}")
+        try:
+            topic = await ctx.tg_create_topic(title)
+        except Exception as exc:  # noqa: BLE001
+            log.error("create_forum_topic failed: %s", exc)
+            await ctx.tg_reply(message, f"❌ Не удалось создать тему: {exc}")
+            return
+        await ctx.db.aadd_link(max_id, topic.message_thread_id, title)
+        thread_id = topic.message_thread_id
+        n = await ctx.tg_backfill_history(thread_id, max_id)
+        await ctx.tg_reply(
+            message,
+            f"✅ Тема «{title}» (id {thread_id}) привязана к MAX‑чату {max_id}. "
+            f"История: {n} сообщений.",
+        )
+
+    @dp.message(Command(commands=["relink"]))
+    async def _cmd_relink(message: Message) -> None:
+        if not (_is_owner(message, ctx) and _in_group(message, ctx)):
+            return
+        parts = message.text.split(maxsplit=1)
+        if len(parts) < 2:
+            await ctx.tg_reply(message, "Использование: <code>/relink &lt;max_chat_id&gt;</code>")
+            return
+        if ctx.max_client is None or not ctx.max_ready.is_set():
+            await ctx.tg_reply(message, "MAX не подключён.")
+            return
+        max_id = parts[1].strip()
+        title = ctx.name_for(max_id, fallback=f"MAX chat {max_id}")
+        existing = await ctx.db.aget_link(max_id)
+        if existing:
+            await ctx.tg_reply(
+                message,
+                f"🔗 Уже привязан: MAX чат {max_id} «{title}» -> тема "
+                f"{existing['tg_topic_id']}. Повторно привязать? Удалите тему/отвязку и /topic.",
+            )
+            return
+        try:
+            topic = await ctx.tg_create_topic(title)
+        except Exception as exc:  # noqa: BLE001
+            log.error("relink create_forum_topic failed: %s", exc)
+            await ctx.tg_reply(message, f"❌ Не удалось создать тему: {exc}")
+            return
+        await ctx.db.aadd_link(max_id, topic.message_thread_id, title)
+        thread_id = topic.message_thread_id
+        n = await ctx.tg_backfill_history(thread_id, max_id)
+        await ctx.tg_reply(
+            message,
+            f"✅ Тема «{title}» (id {thread_id}) создана и привязана к MAX‑чату {max_id}. "
+            f"История: {n} сообщений.",
+        )
+
+    @dp.message(Command(commands=["link"]))
+    async def _cmd_link(message: Message) -> None:
+        if not (_is_owner(message, ctx) and _in_group(message, ctx)):
+            return
+        tid = _real_topic(message, ctx)
+        if tid is None:
+            await ctx.tg_reply(message, "⚠️ Выполняйте в конкретной теме (не в «Общих»).")
+            return
+        parts = message.text.split(maxsplit=1)
+        if len(parts) < 2:
+            await ctx.tg_reply(message, "Использование: <code>/link &lt;max_chat_id&gt;</code>")
+            return
+        max_id = parts[1].strip()
+        title = ctx.name_for(max_id, fallback=f"MAX chat {max_id}")
+        await ctx.db.aadd_link(max_id, tid, title)
+        n = await ctx.tg_backfill_history(tid, max_id)
+        await ctx.tg_reply(
+            message,
+            f"✅ Тема привязана к MAX‑чату {max_id} «{title}». История: {n} сообщений.",
+        )
+
+    @dp.message(Command(commands=["unlink"]))
+    async def _cmd_unlink(message: Message) -> None:
+        if not (_is_owner(message, ctx) and _in_group(message, ctx)):
+            return
+        tid = _real_topic(message, ctx)
+        if tid is None:
+            await ctx.tg_reply(message, "⚠️ Выполняйте в конкретной теме (не в «Общих»).")
+            return
+        link = await ctx.db.aget_link_by_topic(tid)
+        if link is None:
+            await ctx.tg_reply(message, "Эта тема не привязана.")
+            return
+        await ctx.db.adel_link_by_topic(tid)
+        await ctx.tg_reply(message, f"🔓 Тема отвязана от MAX‑чата {link['max_chat_id']}.")
+
+    @dp.message(Command(commands=["presence"]))
+    async def _cmd_presence(message: Message) -> None:
+        if not (_is_owner(message, ctx) and _in_group(message, ctx)):
+            return
+        if ctx.max_client is None or not ctx.max_ready.is_set():
+            await ctx.tg_reply(message, "MAX не подключён.")
+            return
+        parts = message.text.split(maxsplit=1)
+        if len(parts) < 2:
+            if not ctx.presence and not ctx.user_names:
+                await ctx.tg_reply(
+                    message,
+                    "Нет кэшированных данных о присутствии. "
+                    "Ливе лента — в теме «MAX presence» (каждое событие on_presence).",
+                )
+                return
+            lines = ["<b>Присутствие (кэш)</b>:"]
+            for uid in sorted({*ctx.presence, *ctx.user_names}):
+                name = ctx.user_names.get(uid, str(uid))
+                pstr = ctx.presence_str(uid) or "нет данных"
+                lines.append(f"👤 <code>{uid}</code> — {name}: {pstr}")
+            await ctx.tg_reply(message, "\n".join(lines))
+            return
+        try:
+            uid = int(parts[1].strip())
+        except ValueError:
+            await ctx.tg_reply(message, "Использование: <code>/presence &lt;user_id&gt;</code>")
+            return
+        pres = await ctx.query_user_presence(uid)
+        name = ctx.user_names.get(uid) or await ctx.resolve_user_name(uid)
+        pstr = ctx.presence_str(uid) or "нет данных"
+        if pres is None:
+            await ctx.tg_reply(
+                message,
+                f"Нет данных о присутствии для <code>{uid}</code> «{name}». "
+                "Присутствие приходит событиями MAX (логин‑снимок + живые "
+                "обновления в теме «MAX presence»).",
+            )
+        else:
+            await ctx.tg_reply(message, f"👤 <b>{name}</b> <code>{uid}</code> — {pstr}")
+
+    # ---- Telegram -> MAX forwarding (family replies in linked topics) ------
+    async def _build_max_attach(message: Message):
+        """Download media from Telegram and wrap it as a MAX uploadable attachment."""
+        if message.photo:
+            raw = (await ctx.bot.download(message.photo[-1].file_id)).getvalue()
+            return Photo(raw=raw, name="photo.jpg")
+        if message.video:
+            name = message.video.file_name or "video.mp4"
+            raw = (await ctx.bot.download(message.video.file_id)).getvalue()
+            return Video(raw=raw, name=name)
+        if message.voice:
+            raw = (await ctx.bot.download(message.voice.file_id)).getvalue()
+            return Voice(raw=raw, name="voice.ogg")
+        if message.audio:
+            name = message.audio.file_name or "audio.mp3"
+            raw = (await ctx.bot.download(message.audio.file_id)).getvalue()
+            return File(raw=raw, name=name)
+        if message.document:
+            name = message.document.file_name or "file.bin"
+            raw = (await ctx.bot.download(message.document.file_id)).getvalue()
+            return File(raw=raw, name=name)
+        return None
+
+    @dp.message(F.chat.id == ctx.group_id)
+    async def _forward_to_max(message: Message) -> None:
+        # ignore commands and the bot's own confirmations
+        if message.text and message.text.startswith("/"):
+            return
+        if ctx.bot_id and message.from_user and message.from_user.id == ctx.bot_id:
+            return
+        tid = _real_topic(message, ctx)
+        if tid is None:
+            return  # General topic: no MAX binding
+        link = await ctx.db.aget_link_by_topic(tid)
+        if link is None:
+            return  # unlinked topic
+        if ctx.max_client is None or not ctx.max_ready.is_set():
+            return
+
+        sender_name = message.from_user.full_name if message.from_user else "Telegram"
+        text = message.text or ""
+        max_chat = link["max_chat_id"]
+
+        # Optimistic progress note (edited to success/failure after delivery).
+        try:
+            progress = await ctx.tg_reply(message, "⏳ скачиваю/загружаю в MAX…")
+        except Exception:  # noqa: BLE001
+            progress = None
+
+        try:
+            attach = await _build_max_attach(message)
+            if attach is None and not text:
+                return  # nothing forwardable (sticker/animation/editing)
+            if attach is not None:
+                caption = f"{sender_name}:\n\n{text}" if text else None
+                await ctx.max_send_media(max_chat, attach, caption=caption)
+            else:
+                await ctx.max_send(max_chat, f"{sender_name}:\n\n{text}")
+        except Exception as exc:  # noqa: BLE001
+            log.error("Forward TG->MAX failed (chat=%s): %s", max_chat, exc)
+            await ctx.tg_reply(message, "⚠️ Не удалось доставить в MAX (см. логи).")
+            if progress:
+                try:
+                    await progress.edit_text("⚠️ Не удалось доставить в MAX.")
+                except Exception:  # noqa: BLE001
+                    pass
+        else:
+            if progress:
+                try:
+                    await progress.edit_text("✅ Доставлено в MAX.")
+                except Exception:  # noqa: BLE001
+                    await ctx.tg_reply(message, "✅ Доставлено в MAX.")
+            else:
+                await ctx.tg_reply(message, "✅ Доставлено в MAX.")
+
+    return dp
