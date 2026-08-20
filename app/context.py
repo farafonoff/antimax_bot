@@ -63,6 +63,11 @@ class Context:
         self.STATUS_ONLINE_WINDOW = STATUS_ONLINE_WINDOW
         self._presence_poll_task: Optional[asyncio.Task] = None
 
+        # Connectivity: surface MAX (dis)connect events to the Telegram feed.
+        self.max_started: bool = False
+        self.max_disconnected: bool = False
+
+
     # ---- MAX-side helpers -------------------------------------------------
     def name_for(self, chat_id, fallback: str | None = None) -> str:
         key = str(chat_id)
@@ -139,14 +144,44 @@ class Context:
             len(self.presence),
         )
 
-    async def fetch_presence_map(self) -> dict[int, Any]:
+    async def linked_peer_user_ids(self) -> set[int]:
+        """Counterpart user_ids of currently-linked 1:1 (DIALOG) chats only.
+
+        Presence is tracked exclusively for these peers: group/channel chats are
+        excluded (their presence is not meaningful to us). This is the cache
+        invalidation boundary — anything outside this set is dropped on each
+        poll.
+        """
+        chat_id_to_user = {c: u for u, c in self.dialog_user_to_chat.items()}
+        uids: set[int] = set()
+        links = []
+        try:
+            links = await self.db.alist_links()
+        except Exception:  # noqa: BLE001
+            links = []
+        for l in links:
+            mid = self.db.coerce_chat_id(l["max_chat_id"])
+            if not isinstance(mid, int):
+                continue
+            # 1:1 chat: max_chat_id IS the counterpart user id.
+            if mid in chat_id_to_user:
+                uids.add(chat_id_to_user[mid])
+            elif mid in self.dialog_user_to_chat:
+                uids.add(mid)
+        return uids
+
+    async def fetch_presence_map(self, extra_uids: Optional[set[int]] = None) -> dict[int, Any]:
         """Pull the full presence map via the CONTACT_PRESENCE request (opcode 35).
 
         MAX has no public per-user presence RPC and PyMax doesn't wrap this
         call, so we send it raw. The server returns ``{user_id: {seen, status}}``
-        for the account's contacts. We cache it in ``ctx.presence`` keyed by user
-        id (which is what on_message/on_presence/the feed look up).
+        for the account's contacts.
+
+        Cache invalidation: only presence for *linked* 1:1 peers (plus any
+        explicitly-requested ``extra_uids`` from /presence queries) is cached;
+        everything else is pruned so stale entries don't linger.
         """
+
         client = self.max_client
         if client is None or self.self_user_id is None:
             return {}
@@ -168,13 +203,18 @@ class Context:
         payload = getattr(resp, "payload", None) or {}
         raw = payload.get("presence") or {}
         if not isinstance(raw, dict):
-            return {}
+            return self.presence
+        keep = await self.linked_peer_user_ids()
+        if extra_uids:
+            keep |= set(extra_uids)
         changed = 0
         missing = []
         for uid_s, pdata in raw.items():
             try:
                 uid = int(uid_s)
             except (TypeError, ValueError):
+                continue
+            if uid not in keep:
                 continue
             prev = self.presence.get(uid)
             p = Presence(
@@ -187,12 +227,17 @@ class Context:
                 log.debug("presence update uid=%s status=%s seen=%s", uid, p.status, p.seen)
             if uid not in self.user_names:
                 missing.append(uid)
+        # Invalidate: drop presence/names for peers that are no longer linked.
+        for uid in list(self.presence.keys()):
+            if uid not in keep:
+                self.presence.pop(uid, None)
+                self.user_names.pop(uid, None)
+                self._presence_last_emit.pop(uid, None)
         log.info(
-            "CONTACT_PRESENCE: %d contacts cached (%d changed)",
-            len(raw), changed,
+            "CONTACT_PRESENCE: %d contacts reported, %d cached for %d linked peers (%d changed)",
+            len(raw), len(keep & set(raw.keys())), len(self.presence), changed,
         )
-        # Resolve missing user names in a single batched fetch_users call to
-        # avoid 49 sequential fetches (~1 fetch per contact).
+        # Resolve missing user names in a single batched fetch_users call.
         if missing:
             try:
                 users = await self.fetch_users(missing)
@@ -400,7 +445,7 @@ class Context:
         cached = self.presence.get(uid)
         if cached is not None:
             return cached
-        await self.fetch_presence_map()
+        await self.fetch_presence_map(extra_uids={uid})
         return self.presence.get(uid)
 
     async def get_or_create_presence_feed_topic(self) -> Optional[int]:
@@ -421,6 +466,20 @@ class Context:
             log.error("presence feed topic create failed: %s", exc)
             return None
 
+    async def note_connectivity(self, text: str) -> None:
+        """Post a connectivity (dis)connect notice to the presence feed topic."""
+        tid = await self.get_or_create_presence_feed_topic()
+        if tid is None:
+            log.warning("cannot post connectivity notice: no feed topic")
+            return
+        stamp = self._fmt_time(time.time()) or ""
+        prefix = f"⚡ <code>{stamp}</code> · " if stamp else "⚡ "
+        try:
+            await self.tg_post(tid, prefix + text)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("connectivity notice post failed: %s", exc)
+
+
     async def emit_presence_feed(self, user_id, presence) -> None:
         tid = await self.get_or_create_presence_feed_topic()
         if tid is None:
@@ -437,11 +496,14 @@ class Context:
 
         Never raises: a failing presence feed must not break the MAX dispatcher.
         on_presence events are sparse for this account, so most presence data
-        comes from the CONTACT_PRESENCE poll loop (seed_presence/_presence_poll_loop).
+        comes from the CONTACT_PRESENCE poll loop. Live events are only cached
+        for linked 1:1 peers (others are ignored), keeping the cache scoped.
         """
         try:
             uid = int(user_id)
         except (TypeError, ValueError):
+            return
+        if uid not in await self.linked_peer_user_ids():
             return
         prev = self.presence.get(uid)
         self.presence[uid] = presence

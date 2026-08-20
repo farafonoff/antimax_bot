@@ -20,6 +20,17 @@ def build_max_client(ctx: Context) -> Client:
     async def _on_start(c: Client) -> None:
         ctx.max_client = c
         ctx.max_ready.set()
+        if ctx.max_started and not ctx.max_disconnected:
+            # Reconnect after a clean disconnect (pymax re-enters on_start).
+            ctx.max_disconnected = False
+            log.info("MAX client reconnected")
+            await ctx.note_connectivity("✅ MAX переподключён к серверу.")
+        elif ctx.max_started and ctx.max_disconnected:
+            ctx.max_disconnected = False
+            log.info("MAX client reconnected (after disconnect)")
+            await ctx.note_connectivity("✅ MAX переподключён к серверу.")
+        else:
+            ctx.max_started = True
         profile = c.me
         contact = getattr(profile, "contact", None) if profile else None
         ctx.self_user_id = getattr(contact, "id", None)
@@ -48,6 +59,18 @@ def build_max_client(ctx: Context) -> Client:
             f"SMS code requests are injected via Telegram: /sms <code>"
         )
         log.info("MAX client started (owner=%s, chats=%d)", ctx.max_owner_name, len(ctx.max_chats))
+
+    @client.on_disconnect()
+    async def _on_disconnect(exception: Exception, reconnect: bool, delay: float) -> None:
+        # MAX transport dropped. Surface it to the Telegram presence feed and
+        # mark the client down so /status reflects the outage instead of
+        # silently retrying for minutes.
+        ctx.max_disconnected = True
+        ctx.max_ready.clear()
+        log.warning("MAX disconnected: %s (reconnect=%s in %ss)", exception, reconnect, delay)
+        await ctx.note_connectivity(
+            "⚠️ MAX связь потеряна с сервером; пытаюсь переподключиться…"
+        )
 
     @client.on_presence()
     async def _on_presence(event: PresenceEvent, c: Client) -> None:
