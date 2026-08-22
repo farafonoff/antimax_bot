@@ -1,0 +1,9 @@
+services:
+  bridge:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./cache:/bridge/cache   # MAX session (main.db) — keeps you logged in
+      - ./data:/bridge/data     # bridge routing DB
+    stop_grace_period: 15s

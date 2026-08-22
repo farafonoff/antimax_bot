@@ -11,6 +11,7 @@ class SmsInbox:
     def __init__(self) -> None:
         self._queue: Optional[asyncio.Queue[str]] = None
         self.pending = False
+        self.on_request: Optional[callable] = None  # async fn(phone) -> None
 
     def _ensure(self) -> asyncio.Queue[str]:
         if self._queue is None:
@@ -18,7 +19,13 @@ class SmsInbox:
         return self._queue
 
     async def get_code(self, phone: str) -> str:
-        self.pending = True
+        if not self.pending:  # fire only when a NEW code request starts
+            self.pending = True
+            if self.on_request is not None:
+                try:
+                    await self.on_request(phone)
+                except Exception:  # noqa: BLE001
+                    pass
         return await self._ensure().get()
 
     async def set_code(self, code: str) -> None:

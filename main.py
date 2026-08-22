@@ -15,6 +15,7 @@ from app.logger import log
 from app.max_client import build_max_client
 from app.sms_provider import SmsInbox
 from app.tg_bot import build_dispatcher
+from app.tg_logs import start_tg_log_worker
 
 
 def _ensure_dirs(settings):
@@ -24,10 +25,34 @@ def _ensure_dirs(settings):
 
 async def run_max(ctx: Context) -> None:
     client = ctx.max_client
-    try:
-        await client.start()
-    except Exception as exc:  # noqa: BLE001
-        log.exception("MAX client crashed: %s", exc)
+    backoff = 5
+    while True:
+        try:
+            await client.start()
+            # start() returned cleanly -> client closed itself, stop looping.
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.exception("MAX client crashed: %s; restarting in %ss", exc, backoff)
+            ctx.max_disconnected = True
+            ctx.max_ready.clear()
+            try:
+                await ctx.note_connectivity(
+                    f"❌ MAX клиент упал с ошибкой: <code>{exc}</code>\n"
+                    f"Перезапускаю через {backoff}s…"
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 300)
+            try:
+                await client.close()
+            except Exception:  # noqa: BLE001
+                pass
+            # pymax runtime is unusable after a fatal error; rebuild from scratch.
+            client = build_max_client(ctx)
+            ctx.max_client = client
 
 
 async def run_tg(ctx: Context) -> None:
@@ -52,6 +77,22 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     ctx = Context(settings=settings, bot=bot, db=db, sms=sms)
+
+    async def _on_sms_requested(phone: str) -> None:
+        # MAX is blocked waiting for an SMS code (first login or token
+        # revoked). Surface it so the owner can /sms from anywhere.
+        log.warning("MAX requests SMS code for %s", phone)
+        await ctx.note_connectivity(
+            "🔐 <b>MAX запрашивает код из SMS</b> для входа "
+            f"(<code>{phone}</code>).\n"
+            "Отправьте код в эту группу: <code>/sms &lt;код&gt;</code>"
+        )
+
+    sms.on_request = _on_sms_requested
+
+    # Forward WARNING/ERROR logs (app+pymax+aiogram) to the Telegram feed so
+    # MAX-side failures are never silent on an unattended VPS.
+    tg_log_task = start_tg_log_worker(ctx, settings.tg_log_level)
 
     max_client = build_max_client(ctx)
     ctx.max_client = max_client
@@ -90,6 +131,7 @@ async def main() -> None:
             if not t.done():
                 t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        tg_log_task.cancel()
         try:
             await ctx.max_client.close()
         except Exception:  # noqa: BLE001

@@ -22,6 +22,7 @@ class Settings:
     max_work_dir: str
     max_session_name: str
     db_path: str
+    tg_log_level: str
 
 
 def _require(name: str) -> str:
@@ -54,6 +55,7 @@ def load_settings() -> Settings:
         max_work_dir=os.getenv("MAX_WORK_DIR", str(BASE / "cache")) or str(BASE / "cache"),
         max_session_name=os.getenv("MAX_SESSION_NAME", "main.db"),
         db_path=os.getenv("DB_PATH", str(BASE / "data" / "db.sqlite")),
+        tg_log_level=os.getenv("TG_LOG_LEVEL", "WARNING").strip() or "WARNING",
     )
 
 

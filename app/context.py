@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 from aiogram import Bot
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from pymax import Client
 from pymax.types import Name
 from pymax.types.domain import PhotoAttachment, Presence
@@ -20,7 +20,9 @@ from app.sms_provider import SmsInbox
 HISTORY_LIMIT = 20
 PRESENCE_GRACE_SECONDS = 30  # initial presence snapshot window before going live
 PRESENCE_POLL_INTERVAL = 60  # seconds between CONTACT_PRESENCE refreshes
+PRESENCE_EDIT_INTERVAL = 90  # seconds between edits of the live presence message
 STATUS_ONLINE_WINDOW = 300  # seen within this window counts as "online"
+PRESENCE_MSG_KEY = "__presence_feed_msg__"  # links-table key for the live msg id
 
 
 class Context:
@@ -47,12 +49,11 @@ class Context:
         self.presence: dict[int, Any] = {}  # user_id -> Presence
         self.user_names: dict[int, str] = {}  # user_id -> full name (cached)
         self.presence_feed_thread_id: Optional[int] = None
-        # Presence feed throttling: avoid flooding Telegram with every event.
-        self._presence_grace_until: float = 0.0  # snapshot window after login
-        self._presence_live: bool = False  # set True once the snapshot is flushed
-        self._presence_pending: dict[int, Any] = {}  # uid -> presence (snapshot)
-        self._presence_last_emit: dict[int, float] = {}  # uid -> last feed post ts
-        self._presence_min_interval: float = 5.0  # min seconds between feed posts per user
+        # Live presence message: ONE editable message refreshed periodically,
+        # instead of posting a new message per event/snapshot.
+        self._presence_live_msg_id: Optional[int] = None
+        self._presence_dirty: bool = True  # something changed -> edit soon
+        self._presence_last_edit: float = 0.0
         self.self_user_id: Optional[int] = None
         self.max_owner_name: str = "MAX"
         self.bot_id: Optional[int] = None
@@ -232,7 +233,6 @@ class Context:
             if uid not in keep:
                 self.presence.pop(uid, None)
                 self.user_names.pop(uid, None)
-                self._presence_last_emit.pop(uid, None)
         log.info(
             "CONTACT_PRESENCE: %d contacts reported, %d cached for %d linked peers (%d changed)",
             len(raw), len(keep & set(raw.keys())), len(self.presence), changed,
@@ -247,20 +247,32 @@ class Context:
         return self.presence
 
     async def seed_presence(self) -> None:
-        """Seed the cache from CONTACT_PRESENCE and post an initial snapshot."""
+        """Seed the cache from CONTACT_PRESENCE and refresh the live message."""
         await self.fetch_presence_map()
-        self._presence_grace_until = 0.0
-        self._presence_live = True
-        await self._post_presence_snapshot()
+        self._presence_dirty = True
+        self._presence_last_edit = 0.0
+        await self._update_presence_live_message()
 
     async def _presence_poll_loop(self) -> None:
-        """Refresh presence periodically and mirror changes to the feed."""
+        """Refresh presence periodically; mirror into ONE editable message."""
         try:
             await asyncio.sleep(PRESENCE_GRACE_SECONDS)
             await self.seed_presence()
+            last_fetch = time.time()
             while True:
-                await asyncio.sleep(PRESENCE_POLL_INTERVAL)
-                await self.fetch_presence_map()
+                now = time.time()
+                if self._presence_dirty or now - self._presence_last_edit >= PRESENCE_EDIT_INTERVAL:
+                    try:
+                        await self._update_presence_live_message()
+                        self._presence_dirty = False
+                        self._presence_last_edit = time.time()
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug("live presence edit failed: %s", exc)
+                await asyncio.sleep(15)
+                if time.time() - last_fetch >= PRESENCE_POLL_INTERVAL:
+                    await self.fetch_presence_map()
+                    self._presence_dirty = True
+                    last_fetch = time.time()
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -270,19 +282,48 @@ class Context:
         if self._presence_poll_task is None or self._presence_poll_task.done():
             self._presence_poll_task = asyncio.create_task(self._presence_poll_loop())
 
-    async def _post_presence_snapshot(self) -> None:
-        """Post one summary of all currently-cached presence to the feed topic."""
+    async def _build_presence_snapshot_text(self) -> str:
+        stamp = self._fmt_time(time.time()) or ""
+        head = f"<b>MAX presence</b> · <code>{stamp}</code>"
         if not self.presence:
-            return
-        lines = [f"<b>MAX presence (snapshot, {len(self.presence)} контактов)</b>:"]
+            return f"{head}\n<i>нет данных о контактах</i>"
+        lines = [head]
         for uid in sorted(self.presence.keys()):
             name = await self.resolve_user_name(uid)
             pstr = self.presence_str(uid) or "нет данных"
             lines.append(f"👤 <code>{uid}</code> — {name}: {pstr}")
-            self._presence_last_emit[uid] = time.time()
+        return "\n".join(lines)
+
+    async def _update_presence_live_message(self) -> None:
+        """Create once, then EDIT the single live presence message."""
         tid = await self.get_or_create_presence_feed_topic()
-        if tid is not None:
-            await self.tg_post(tid, "\n".join(lines))
+        if tid is None:
+            return
+        text = await self._build_presence_snapshot_text()
+        if self._presence_live_msg_id is None:
+            row = await self.db.aget_link(PRESENCE_MSG_KEY)
+            if row and row.get("tg_topic_id"):
+                self._presence_live_msg_id = int(row["tg_topic_id"])
+        try:
+            await self.bot.edit_message_text(
+                text,
+                chat_id=self.group_id,
+                message_id=self._presence_live_msg_id,
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        except TelegramBadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                return
+            # deleted / never existed -> fall through and (re)create below
+            self._presence_live_msg_id = None
+        except TypeError:
+            pass  # msg id unknown yet
+        msg = await self.tg_post(tid, text)
+        new_id = getattr(msg, "message_id", None)
+        if new_id:
+            self._presence_live_msg_id = new_id
+            await self.db.aadd_link(PRESENCE_MSG_KEY, new_id, "presence live message")
 
     @staticmethod
     def user_full_name(user) -> str:
@@ -479,20 +520,21 @@ class Context:
         except Exception as exc:  # noqa: BLE001
             log.debug("connectivity notice post failed: %s", exc)
 
-
-    async def emit_presence_feed(self, user_id, presence) -> None:
+    async def tg_log_feed(self, text: str) -> None:
+        """Sink for forwarded WARNING/ERROR logs (app/tg_logs.py)."""
         tid = await self.get_or_create_presence_feed_topic()
         if tid is None:
             return
-        name = await self.resolve_user_name(user_id)
-        pstr = self.presence_str(user_id) or "нет данных"
-        await self.tg_post(
-            tid,
-            f"{self._fmt_time(time.time())} · <b>{name}</b> {pstr} <code>{user_id}</code>",
-        )
+        stamp = self._fmt_time(time.time()) or ""
+        prefix = f"📝 <code>{stamp}</code>\n" if stamp else ""
+        try:
+            await self.tg_post(tid, prefix + text)
+        except Exception:  # noqa: BLE001
+            pass
+
 
     async def on_presence_update(self, user_id, presence) -> None:
-        """Cache an on_presence event + (when live) mirror it to the feed topic.
+        """Cache an on_presence event; the live message picks it up on next edit.
 
         Never raises: a failing presence feed must not break the MAX dispatcher.
         on_presence events are sparse for this account, so most presence data
@@ -505,7 +547,6 @@ class Context:
             return
         if uid not in await self.linked_peer_user_ids():
             return
-        prev = self.presence.get(uid)
         self.presence[uid] = presence
         log.info(
             "presence event uid=%s status=%s seen=%s",
@@ -513,19 +554,7 @@ class Context:
             getattr(presence, "status", None),
             getattr(presence, "seen", None),
         )
-        if not self._presence_live:
-            return
-        if prev is not None and prev == presence:
-            return
-        now = time.time()
-        last = self._presence_last_emit.get(uid, 0.0)
-        if now - last < self._presence_min_interval:
-            return
-        self._presence_last_emit[uid] = now
-        try:
-            await self.emit_presence_feed(uid, presence)
-        except Exception as exc:  # noqa: BLE001
-            log.debug("presence feed emit failed: %s", exc)
+        self._presence_dirty = True
 
     async def fetch_max_history(self, max_chat_id, count: int = HISTORY_LIMIT):
         """Recent messages from a MAX chat (oldest first)."""
