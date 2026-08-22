@@ -24,6 +24,7 @@ def _ensure_dirs(settings):
 
 
 TOKEN_ROTATE_INTERVAL = 12 * 3600  # periodic re-login rotates the MAX token
+AUTH_FAILURE_COOLDOWN = 180  # pause before asking MAX for a fresh SMS code
 
 
 async def run_max(ctx: Context) -> None:
@@ -37,19 +38,23 @@ async def run_max(ctx: Context) -> None:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
-            log.exception("MAX client crashed: %s; restarting in %ss", exc, backoff)
+            log.exception("MAX client crashed: %s; restarting", exc)
             ctx.max_disconnected = True
             ctx.max_ready.clear()
+            # If we died mid-auth (expired/wrong code etc.), MAX counts each
+            # code attempt; cool down before requesting a fresh SMS.
+            auth_failure = ctx.sms.state.value != "idle"
             ctx.sms.reset()  # auth flow died; next get_code starts fresh
+            delay = AUTH_FAILURE_COOLDOWN if auth_failure else backoff
             try:
                 await ctx.note_connectivity(
                     f"❌ MAX клиент упал с ошибкой: <code>{exc}</code>\n"
-                    f"Перезапускаю через {backoff}s…"
+                    f"{'Запрошу новый SMS-код через %ds' % delay if auth_failure else 'Перезапускаю через %ds…' % delay}"
                 )
             except Exception:  # noqa: BLE001
                 pass
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 300)
+            await asyncio.sleep(delay)
+            backoff = min(backoff * 2, 300) if not auth_failure else 5
         else:
             await asyncio.sleep(backoff)
         try:
