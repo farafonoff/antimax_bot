@@ -247,37 +247,46 @@ class Context:
                 log.debug("batch fetch_users failed: %s", exc)
         return self.presence
 
-    async def seed_presence(self) -> None:
-        """Seed the cache from CONTACT_PRESENCE and refresh the live message."""
-        await self.fetch_presence_map()
-        self._presence_dirty = True
-        self._presence_last_edit = 0.0
-        await self._update_presence_live_message()
-
     async def _presence_poll_loop(self) -> None:
-        """Refresh presence periodically; mirror into ONE editable message."""
-        try:
-            await asyncio.sleep(PRESENCE_GRACE_SECONDS)
-            await self.seed_presence()
-            last_fetch = time.time()
-            while True:
+        """Refresh presence periodically; mirror into ONE editable message.
+        Never exits on errors — a deleted topic or failed edit just retries."""
+        await asyncio.sleep(PRESENCE_GRACE_SECONDS)
+        last_fetch = 0.0
+        while True:
+            try:
                 now = time.time()
+                if now - last_fetch >= PRESENCE_POLL_INTERVAL:
+                    await self.fetch_presence_map()
+                    self._presence_dirty = True
+                    last_fetch = now
                 if self._presence_dirty or now - self._presence_last_edit >= PRESENCE_EDIT_INTERVAL:
                     try:
                         await self._update_presence_live_message()
                         self._presence_dirty = False
                         self._presence_last_edit = time.time()
-                    except Exception as exc:  # noqa: BLE001
-                        log.debug("live presence edit failed: %s", exc)
-                await asyncio.sleep(15)
-                if time.time() - last_fetch >= PRESENCE_POLL_INTERVAL:
-                    await self.fetch_presence_map()
-                    self._presence_dirty = True
-                    last_fetch = time.time()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            log.warning("presence poll loop ended: %s", exc)
+                    except TelegramBadRequest as exc:
+                        if "message thread not found" in str(exc).lower():
+                            # topic was deleted in Telegram -> recreate it
+                            log.warning("presence topic deleted; recreating")
+                            await self._invalidate_presence_topic()
+                            await self._update_presence_live_message()
+                            self._presence_dirty = False
+                            self._presence_last_edit = time.time()
+                        else:
+                            raise
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.warning("presence tick failed: %s", exc)
+            await asyncio.sleep(15)
+
+    async def _invalidate_presence_topic(self) -> None:
+        """Forget the presence topic + live message (e.g. topic was deleted)."""
+        self.presence_feed_thread_id = None
+        self._presence_live_msg_id = None
+        # 0 is treated as "no topic" by get_or_create_* -> forces recreation.
+        await self.db.aadd_link("__presence_feed__", 0, "MAX presence")
+        await self.db.aadd_link(PRESENCE_MSG_KEY, 0, "presence live message")
 
     def start_presence_poll(self) -> None:
         if self._presence_poll_task is None or self._presence_poll_task.done():
@@ -511,29 +520,35 @@ class Context:
     async def note_connectivity(self, text: str) -> None:
         """Post a connectivity/auth notice into the dedicated 'MAX logs' topic,
         keeping the presence topic strictly for presence."""
-        tid = await self.get_or_create_logs_feed_topic()
-        if tid is None:
-            log.warning("cannot post connectivity notice: no logs topic")
-            return
         stamp = self._fmt_time(time.time()) or ""
         prefix = f"⚡ <code>{stamp}</code> · " if stamp else "⚡ "
-        try:
-            await self.tg_post(tid, prefix + text)
-        except Exception as exc:  # noqa: BLE001
-            log.debug("connectivity notice post failed: %s", exc)
+        await self._post_to_logs(prefix + text)
 
     async def tg_log_feed(self, text: str) -> None:
-        """Sink for forwarded WARNING/ERROR logs (app/tg_logs.py).
-        Posts into a dedicated 'MAX logs' topic, never the presence topic."""
-        tid = await self.get_or_create_logs_feed_topic()
-        if tid is None:
-            return
+        """Sink for forwarded WARNING/ERROR logs (app/tg_logs.py)."""
         stamp = self._fmt_time(time.time()) or ""
         prefix = f"📝 <code>{stamp}</code>\n" if stamp else ""
-        try:
-            await self.tg_post(tid, prefix + text)
-        except Exception:  # noqa: BLE001
-            pass
+        await self._post_to_logs(prefix + text)
+
+    async def _post_to_logs(self, text: str) -> None:
+        """Post into the 'MAX logs' topic; recreates the topic if deleted."""
+        for attempt in range(2):
+            tid = await self.get_or_create_logs_feed_topic()
+            if tid is None:
+                return
+            try:
+                await self.tg_post(tid, text)
+                return
+            except TelegramBadRequest as exc:
+                if "message thread not found" not in str(exc).lower():
+                    return  # drop silently; retrying risks loops
+                if attempt > 0:
+                    return
+                log.warning("logs topic deleted; recreating")
+                self.logs_feed_thread_id = None
+                await self.db.aadd_link("__logs_feed__", 0, "MAX logs")
+            except Exception:  # noqa: BLE001
+                return
 
     async def get_or_create_logs_feed_topic(self) -> Optional[int]:
         if self.logs_feed_thread_id is not None:
