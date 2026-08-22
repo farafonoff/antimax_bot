@@ -55,8 +55,15 @@ def build_dispatcher(ctx: Context) -> Dispatcher:
     async def _cmd_status(message: Message) -> None:
         if not (_is_owner(message, ctx) and _in_group(message, ctx)):
             return
+        if ctx.sms.state.value != "idle":
+            await ctx.tg_reply(
+                message,
+                f"MAX: 🔐 вход не завершён (состояние: <code>{ctx.sms.state.value}</code>). "
+                "Ожидается /sms &lt;код&gt;.",
+            )
+            return
         if ctx.max_client is None or not ctx.max_ready.is_set():
-            await ctx.tg_reply(message, "MAX: ⏳ не подключён (нужен /sms для входа).")
+            await ctx.tg_reply(message, "MAX: ⏳ не подключён.")
             return
         links = await ctx.db.alist_links()
         await ctx.tg_reply(
@@ -73,8 +80,14 @@ def build_dispatcher(ctx: Context) -> Dispatcher:
         if len(parts) < 2 or not parts[1].strip():
             await ctx.tg_reply(message, "Использование: <code>/sms &lt;код&gt;</code>")
             return
-        await ctx.sms.set_code(parts[1].strip())
-        await ctx.tg_reply(message, "✅ Код передан MAX.")
+        if await ctx.sms.set_code(parts[1].strip()):
+            await ctx.tg_reply(message, "✅ Код передан MAX.")
+        else:
+            await ctx.tg_reply(
+                message,
+                "⚠️ MAX сейчас не запрашивает код (состояние: "
+                f"<code>{ctx.sms.state.value}</code>). Код не принят.",
+            )
 
     @dp.message(Command(commands=["max"]))
     async def _cmd_max_chats(message: Message) -> None:

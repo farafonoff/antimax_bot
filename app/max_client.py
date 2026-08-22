@@ -20,6 +20,9 @@ def build_max_client(ctx: Context) -> Client:
     async def _on_start(c: Client) -> None:
         ctx.max_client = c
         ctx.max_ready.set()
+        # Auth flow completed (or cached session worked): close any pending
+        # SMS-request session so /sms can't submit codes into the void.
+        ctx.sms.reset()
         if ctx.max_started and not ctx.max_disconnected:
             # Reconnect after a clean disconnect (pymax re-enters on_start).
             ctx.max_disconnected = False

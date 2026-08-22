@@ -23,20 +23,24 @@ def _ensure_dirs(settings):
     os.makedirs(os.path.dirname(settings.db_path) or ".", exist_ok=True)
 
 
+TOKEN_ROTATE_INTERVAL = 12 * 3600  # periodic re-login rotates the MAX token
+
+
 async def run_max(ctx: Context) -> None:
-    client = ctx.max_client
     backoff = 5
     while True:
+        client = ctx.max_client
         try:
             await client.start()
-            # start() returned cleanly -> client closed itself, stop looping.
-            return
+            log.warning("MAX client stopped cleanly; restarting in %ss", backoff)
+            # Clean exit still leaves the runtime closed -> rebuild below.
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
             log.exception("MAX client crashed: %s; restarting in %ss", exc, backoff)
             ctx.max_disconnected = True
             ctx.max_ready.clear()
+            ctx.sms.reset()  # auth flow died; next get_code starts fresh
             try:
                 await ctx.note_connectivity(
                     f"❌ MAX клиент упал с ошибкой: <code>{exc}</code>\n"
@@ -46,13 +50,27 @@ async def run_max(ctx: Context) -> None:
                 pass
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 300)
+        else:
+            await asyncio.sleep(backoff)
+        try:
+            await client.close()
+        except Exception:  # noqa: BLE001
+            pass
+        # pymax runtime is unusable after close(); rebuild from scratch.
+        ctx.max_client = build_max_client(ctx)
+
+
+async def run_token_rotation(ctx: Context) -> None:
+    """Re-login periodically: MAX rotates the token on every login, which is
+    the only refresh mechanism available. Prevents slow server-side expiry."""
+    while True:
+        await asyncio.sleep(TOKEN_ROTATE_INTERVAL)
+        if ctx.max_client is not None and ctx.max_ready.is_set():
+            log.info("scheduled MAX re-login (token rotation)")
             try:
-                await client.close()
-            except Exception:  # noqa: BLE001
-                pass
-            # pymax runtime is unusable after a fatal error; rebuild from scratch.
-            client = build_max_client(ctx)
-            ctx.max_client = client
+                await ctx.max_client.stop()
+            except Exception as exc:  # noqa: BLE001
+                log.debug("token rotation stop failed: %s", exc)
 
 
 async def run_tg(ctx: Context) -> None:
@@ -106,7 +124,8 @@ async def main() -> None:
 
     max_task = asyncio.create_task(run_max(ctx))
     tg_task = asyncio.create_task(run_tg(ctx))
-    tasks = (max_task, tg_task)
+    rotate_task = asyncio.create_task(run_token_rotation(ctx))
+    tasks = (max_task, tg_task, rotate_task)
 
     loop = asyncio.get_running_loop()
 
