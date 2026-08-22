@@ -49,6 +49,7 @@ class Context:
         self.presence: dict[int, Any] = {}  # user_id -> Presence
         self.user_names: dict[int, str] = {}  # user_id -> full name (cached)
         self.presence_feed_thread_id: Optional[int] = None
+        self.logs_feed_thread_id: Optional[int] = None
         # Live presence message: ONE editable message refreshed periodically,
         # instead of posting a new message per event/snapshot.
         self._presence_live_msg_id: Optional[int] = None
@@ -508,10 +509,11 @@ class Context:
             return None
 
     async def note_connectivity(self, text: str) -> None:
-        """Post a connectivity (dis)connect notice to the presence feed topic."""
-        tid = await self.get_or_create_presence_feed_topic()
+        """Post a connectivity/auth notice into the dedicated 'MAX logs' topic,
+        keeping the presence topic strictly for presence."""
+        tid = await self.get_or_create_logs_feed_topic()
         if tid is None:
-            log.warning("cannot post connectivity notice: no feed topic")
+            log.warning("cannot post connectivity notice: no logs topic")
             return
         stamp = self._fmt_time(time.time()) or ""
         prefix = f"⚡ <code>{stamp}</code> · " if stamp else "⚡ "
@@ -521,8 +523,9 @@ class Context:
             log.debug("connectivity notice post failed: %s", exc)
 
     async def tg_log_feed(self, text: str) -> None:
-        """Sink for forwarded WARNING/ERROR logs (app/tg_logs.py)."""
-        tid = await self.get_or_create_presence_feed_topic()
+        """Sink for forwarded WARNING/ERROR logs (app/tg_logs.py).
+        Posts into a dedicated 'MAX logs' topic, never the presence topic."""
+        tid = await self.get_or_create_logs_feed_topic()
         if tid is None:
             return
         stamp = self._fmt_time(time.time()) or ""
@@ -531,6 +534,24 @@ class Context:
             await self.tg_post(tid, prefix + text)
         except Exception:  # noqa: BLE001
             pass
+
+    async def get_or_create_logs_feed_topic(self) -> Optional[int]:
+        if self.logs_feed_thread_id is not None:
+            return self.logs_feed_thread_id
+        row = await self.db.aget_link("__logs_feed__")
+        if row and row.get("tg_topic_id"):
+            self.logs_feed_thread_id = int(row["tg_topic_id"])
+            return self.logs_feed_thread_id
+        try:
+            topic = await self.tg_create_topic("MAX logs")
+            self.logs_feed_thread_id = topic.message_thread_id
+            await self.db.aadd_link(
+                "__logs_feed__", self.logs_feed_thread_id, "MAX logs"
+            )
+            return self.logs_feed_thread_id
+        except Exception as exc:  # noqa: BLE001
+            log.error("logs feed topic create failed: %s", exc)
+            return None
 
 
     async def on_presence_update(self, user_id, presence) -> None:
