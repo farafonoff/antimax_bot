@@ -59,7 +59,7 @@ def build_dispatcher(ctx: Context) -> Dispatcher:
             "/tg_channels — список известных TG каналов (где бот админ)\n\n"
             "<b>4. Система / Статус</b>\n"
             "/status — статус MAX подключения и привязок\n"
-            "/sms <код> — ввести код SMS для входа в MAX\n"
+            "/sms <code>код</code> — ввести код SMS для входа в MAX\n"
             "/presence [<code>user_id</code>] — статус контактов (живая лента в теме «MAX presence»)\n\n"
             "<b>Как узнать ID:</b>\n"
             "• MAX chat_id: /max_chats_full или в /max chats (👤 = личный чат, chat_id == user_id)\n"
@@ -134,7 +134,7 @@ def build_dispatcher(ctx: Context) -> Dispatcher:
                 hint = f" | /presence {uid}"
             lines.append(f"{'👤' if is_1to1 else '👥'} <code>{cid}</code> — {title}{pres}{tag}{hint}")
         lines.append("")
-        lines.append("<i>👤 — личный чат (1:1); /presence <user_id> — статус контакта.</i>")
+        lines.append("<i>👤 — личный чат (1:1); /presence <code>user_id</code> — статус контакта.</i>")
         await ctx.tg_reply(message, "\n".join(lines))
 
     @dp.message(Command(commands=["max_chats_full"]))
