@@ -483,7 +483,7 @@ def build_dispatcher(ctx: Context) -> Dispatcher:
             return
         tid = _real_topic(message, ctx)
         if tid is None:
-            log.debug("TG->MAX: message in General topic (tid=None), skipping")
+            log.info("TG->MAX: message in General topic (tid=None), skipping")
             return
         link = await ctx.db.aget_link_by_topic(tid)
         if link is None:
@@ -513,7 +513,7 @@ def build_dispatcher(ctx: Context) -> Dispatcher:
             
             attach = await _build_max_attach(message)
             if attach is None and not text:
-                log.debug("TG->MAX: no forwardable content (sticker/animation/editing)")
+                log.info("TG->MAX: no forwardable content (sticker/animation/editing)")
                 return
             if attach is not None:
                 caption = f"{sender_name}:\n\n{text}" if text else None
