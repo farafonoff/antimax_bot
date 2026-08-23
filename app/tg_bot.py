@@ -369,6 +369,54 @@ def build_dispatcher(ctx: Context) -> Dispatcher:
         except Exception as exc:
             await ctx.tg_reply(message, f"❌ Ошибка теста: {exc}")
 
+    @dp.message(Command(commands=["preview_forward"]))
+    async def _cmd_preview_forward(message: Message) -> None:
+        """Show exactly how this message would look when forwarded to MAX."""
+        if not (_is_owner(message, ctx) and _in_group(message, ctx)):
+            return
+        tid = _real_topic(message, ctx)
+        if tid is None:
+            await ctx.tg_reply(message, "Вы в General теме — привязки нет.")
+            return
+        link = await ctx.db.aget_link_by_topic(tid)
+        if link is None:
+            await ctx.tg_reply(message, f"Тема <code>{tid}</code> не привязана к MAX чату.")
+            return
+
+        sender_name = message.from_user.full_name if message.from_user else "Telegram"
+        text = message.text or ""
+        
+        # Show the exact format that goes to MAX
+        header = f"<b>{sender_name}</b>"
+        if message.from_user:
+            header += f" <code>{message.from_user.id}</code>"
+        header += ":\n\n"
+        
+        # Check media
+        media_info = []
+        if message.photo:
+            media_info.append(f"📷 Фото ({len(message.photo)} размеров, берём максимальное)")
+        if message.video:
+            media_info.append(f"🎬 Видео: {message.video.file_name or 'video.mp4'}")
+        if message.document:
+            media_info.append(f"📄 Документ: {message.document.file_name or 'file.bin'}")
+        if message.audio:
+            media_info.append(f"🎵 Аудио: {message.audio.file_name or 'audio.mp3'}")
+        if message.voice:
+            media_info.append(f"🎤 Голосовое")
+        if message.sticker:
+            media_info.append(f"🎭 Стикер (MAX не поддерживает, будет проигнорирован)")
+
+        preview = (
+            "<b>📋 ПРЕВЬЮ: как это сообщение уйдёт в MAX</b>\n\n"
+            f"{header}{text or '<i>(нет текста)</i>'}\n\n"
+            f"<b>Вложения:</b> {' | '.join(media_info) if media_info else 'нет'}\n\n"
+            f"MAX чат: <code>{link['max_chat_id']}</code>\n"
+            "—\n"
+            "<i>Это только превью. Чтобы действительно отправить тест — /debug_forward</i>"
+        )
+        await ctx.tg_reply(message, preview)
+
     @dp.message(Command(commands=["unlink"]))
     async def _cmd_unlink(message: Message) -> None:
         if not (_is_owner(message, ctx) and _in_group(message, ctx)):
