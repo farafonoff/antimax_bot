@@ -486,7 +486,6 @@ class Context:
             lambda: self.bot.send_document(
                 chat_id=self.group_id,
                 document=url,
-                filename=filename,
                 caption=caption_html,
                 message_thread_id=thread_id,
                 parse_mode=ParseMode.HTML,

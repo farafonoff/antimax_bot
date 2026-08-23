@@ -164,7 +164,7 @@ def build_max_client(ctx: Context) -> Client:
             # FileAttachment has token; need to construct download URL
             # MAX uses token for download: https://max-api.vk.com/attachments/download/<token>?format=json
             download_url = f"https://max-api.vk.com/attachments/download/{f.token}?format=json"
-            await ctx.tg_send_document(thread_id, download_url, filename=f.name, caption_html=caption)
+            await ctx.tg_send_document(thread_id, download_url, caption_html=caption)
             sent = True
             caption = None
 
