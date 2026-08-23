@@ -69,6 +69,9 @@ class Context:
         self.max_started: bool = False
         self.max_disconnected: bool = False
 
+        # Known TG channels/groups where bot was added
+        self.known_tg_channels: dict[int, dict] = {}
+
 
     # ---- MAX-side helpers -------------------------------------------------
     def name_for(self, chat_id, fallback: str | None = None) -> str:

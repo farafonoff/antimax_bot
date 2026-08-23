@@ -30,6 +30,16 @@ class LinksDB:
                 )
                 """
             )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS channel_forwards (
+                    tg_channel_id INTEGER PRIMARY KEY,
+                    max_chat_id   TEXT NOT NULL,
+                    name          TEXT,
+                    created_at    REAL DEFAULT (strftime('%s','now'))
+                )
+                """
+            )
             con.commit()
 
     @staticmethod
@@ -83,6 +93,37 @@ class LinksDB:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    # channel forwards
+    def get_forward(self, tg_channel_id: int) -> dict | None:
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT * FROM channel_forwards WHERE tg_channel_id = ?", (tg_channel_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def add_forward(self, tg_channel_id: int, max_chat_id, name: str | None = None) -> dict:
+        with self._connect() as con:
+            con.execute(
+                "INSERT OR REPLACE INTO channel_forwards (tg_channel_id, max_chat_id, name) VALUES (?, ?, ?)",
+                (tg_channel_id, str(max_chat_id), name),
+            )
+            con.commit()
+        return self.get_forward(tg_channel_id) or {}
+
+    def del_forward(self, tg_channel_id: int) -> None:
+        with self._connect() as con:
+            con.execute(
+                "DELETE FROM channel_forwards WHERE tg_channel_id = ?", (tg_channel_id,)
+            )
+            con.commit()
+
+    def list_forwards(self) -> list[dict]:
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT * FROM channel_forwards ORDER BY created_at DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     # async wrappers
     async def aget_link(self, max_chat_id) -> dict | None:
         return await asyncio.to_thread(self.get_link, max_chat_id)
@@ -98,3 +139,15 @@ class LinksDB:
 
     async def alist_links(self) -> list[dict]:
         return await asyncio.to_thread(self.list_links)
+
+    async def aget_forward(self, tg_channel_id: int) -> dict | None:
+        return await asyncio.to_thread(self.get_forward, tg_channel_id)
+
+    async def aadd_forward(self, tg_channel_id: int, max_chat_id, name: str | None = None) -> dict:
+        return await asyncio.to_thread(self.add_forward, tg_channel_id, max_chat_id, name)
+
+    async def adel_forward(self, tg_channel_id: int) -> None:
+        await asyncio.to_thread(self.del_forward, tg_channel_id)
+
+    async def alist_forwards(self) -> list[dict]:
+        return await asyncio.to_thread(self.list_forwards)

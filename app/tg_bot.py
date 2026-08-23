@@ -117,8 +117,76 @@ def build_dispatcher(ctx: Context) -> Dispatcher:
                 hint = f" | /presence {uid}"
             lines.append(f"{'👤' if is_1to1 else '👥'} <code>{cid}</code> — {title}{pres}{tag}{hint}")
         lines.append("")
-        lines.append("<i>👤 — личный чат (1:1); /presence &lt;user_id&gt; — статус контакта.</i>")
+        lines.append("<i>👤 — личный чат (1:1); /presence <user_id> — статус контакта.</i>")
         await ctx.tg_reply(message, "\n".join(lines))
+
+    @dp.message(Command(commands=["max_chats_full"]))
+    async def _cmd_max_chats_full(message: Message) -> None:
+        if not (_is_owner(message, ctx) and _in_group(message, ctx)):
+            return
+        if ctx.max_client is None or not ctx.max_ready.is_set():
+            await ctx.tg_reply(message, "MAX не подключён.")
+            return
+        try:
+            chats = await ctx.max_client.fetch_chats()
+        except Exception as exc:  # noqa: BLE001
+            log.error("fetch_chats failed: %s", exc)
+            await ctx.tg_reply(message, f"❌ Ошибка: {exc}")
+            return
+        lines = ["<b>Все MAX чаты (fetch_chats):</b>"]
+        for c in chats:
+            ctype = getattr(c, "type", "?")
+            title = getattr(c, "title", None) or getattr(c, "id", "?")
+            cid = getattr(c, "id", "?")
+            lines.append(f"<code>{cid}</code> [{ctype}] — {title}")
+        await ctx.tg_reply(message, "\n".join(lines))
+
+    @dp.message(Command(commands=["tg_channels"]))
+    async def _cmd_tg_channels(message: Message) -> None:
+        if not (_is_owner(message, ctx) and _in_group(message, ctx)):
+            return
+        # Bot can only know about chats it was added to or can get via get_chat
+        # We track channels via my_chat_member events (see below)
+        if not hasattr(ctx, "known_tg_channels") or not ctx.known_tg_channels:
+            await ctx.tg_reply(
+                message,
+                "Нет известных каналов. Добавьте бота в канал как админа, "
+                "или перешлите сообщение из канала боту — он покажет ID."
+            )
+            return
+        lines = ["<b>Известные TG каналы/группы:</b>"]
+        for chat_id, info in ctx.known_tg_channels.items():
+            title = info.get("title", "?")
+            ctype = info.get("type", "?")
+            lines.append(f"<code>{chat_id}</code> [{ctype}] — {title}")
+        await ctx.tg_reply(message, "\n".join(lines))
+
+    # Track when bot is added to channels/groups
+    @dp.my_chat_member()
+    async def _on_my_chat_member(event: ChatMemberUpdated) -> None:
+        if event.new_chat_member is None:
+            return
+        status = event.new_chat_member.status
+        if status in ("member", "administrator", "creator"):
+            chat = event.chat
+            if chat.type in ("channel", "supergroup"):
+                ctx.known_tg_channels[chat.id] = {
+                    "title": chat.title,
+                    "type": chat.type,
+                    "username": chat.username,
+                }
+                log.info("Bot added to TG %s: %s (%s)", chat.type, chat.title, chat.id)
+                # Notify owner
+                try:
+                    await ctx.bot.send_message(
+                        ctx.owner_id,
+                        f"🤖 Бот добавлен в {chat.type}: <b>{chat.title}</b>\n"
+                        f"ID: <code>{chat.id}</code>\n"
+                        f"Используйте <code>/add_forward {chat.id} <max_chat_id></code>",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
 
     @dp.message(Command(commands=["topic"]))
     async def _cmd_topic(message: Message) -> None:
@@ -205,6 +273,65 @@ def build_dispatcher(ctx: Context) -> Dispatcher:
             f"✅ Тема привязана к MAX‑чату {max_id} «{title}». История: {n} сообщений.",
         )
 
+    @dp.message(Command(commands=["add_forward"]))
+    async def _cmd_add_forward(message: Message) -> None:
+        if not (_is_owner(message, ctx) and _in_group(message, ctx)):
+            return
+        parts = message.text.split(maxsplit=2)
+        if len(parts) < 3:
+            await ctx.tg_reply(
+                message,
+                "Использование: <code>/add_forward <tg_channel_id> <max_chat_id> [name]</code>\n"
+                "tg_channel_id — ID канала-источника (отрицательный, с -100...)\n"
+                "max_chat_id — ID чата в MAX для пересылки",
+            )
+            return
+        try:
+            tg_channel_id = int(parts[1])
+            max_chat_id = parts[2].strip()
+            name = parts[3] if len(parts) > 3 else None
+        except ValueError:
+            await ctx.tg_reply(message, "tg_channel_id должен быть числом.")
+            return
+        if ctx.max_client is None or not ctx.max_ready.is_set():
+            await ctx.tg_reply(message, "MAX не подключён.")
+            return
+        await ctx.db.aadd_forward(tg_channel_id, max_chat_id, name)
+        await ctx.tg_reply(
+            message,
+            f"✅ Канал <code>{tg_channel_id}</code> → MAX чат <code>{max_chat_id}</code> добавлен."
+        )
+
+    @dp.message(Command(commands=["remove_forward", "del_forward"]))
+    async def _cmd_remove_forward(message: Message) -> None:
+        if not (_is_owner(message, ctx) and _in_group(message, ctx)):
+            return
+        parts = message.text.split(maxsplit=1)
+        if len(parts) < 2:
+            await ctx.tg_reply(message, "Использование: <code>/remove_forward <tg_channel_id></code>")
+            return
+        try:
+            tg_channel_id = int(parts[1])
+        except ValueError:
+            await ctx.tg_reply(message, "tg_channel_id должен быть числом.")
+            return
+        await ctx.db.adel_forward(tg_channel_id)
+        await ctx.tg_reply(message, f"✅ Форвард для канала <code>{tg_channel_id}</code> удалён.")
+
+    @dp.message(Command(commands=["list_forwards"]))
+    async def _cmd_list_forwards(message: Message) -> None:
+        if not (_is_owner(message, ctx) and _in_group(message, ctx)):
+            return
+        forwards = await ctx.db.alist_forwards()
+        if not forwards:
+            await ctx.tg_reply(message, "Список форвардов пуст.")
+            return
+        lines = ["<b>Telegram Channel → MAX Chat форварды:</b>"]
+        for f in forwards:
+            name = f.get("name") or "—"
+            lines.append(f"<code>{f['tg_channel_id']}</code> → <code>{f['max_chat_id']}</code> ({name})")
+        await ctx.tg_reply(message, "\n".join(lines))
+
     @dp.message(Command(commands=["unlink"]))
     async def _cmd_unlink(message: Message) -> None:
         if not (_is_owner(message, ctx) and _in_group(message, ctx)):
@@ -219,6 +346,57 @@ def build_dispatcher(ctx: Context) -> Dispatcher:
             return
         await ctx.db.adel_link_by_topic(tid)
         await ctx.tg_reply(message, f"🔓 Тема отвязана от MAX‑чата {link['max_chat_id']}.")
+
+    @dp.channel_post()
+    async def _forward_channel_to_max(message: Message) -> None:
+        """Forward channel posts to configured MAX chats."""
+        if message.chat is None:
+            return
+        forward = await ctx.db.aget_forward(message.chat.id)
+        if forward is None:
+            return
+        if ctx.max_client is None or not ctx.max_ready.is_set():
+            return
+
+        max_chat_id = forward["max_chat_id"]
+        text = message.text or message.caption or ""
+        attaches = []
+
+        # Handle media
+        if message.photo:
+            from pymax import Photo
+            raw = (await ctx.bot.download(message.photo[-1].file_id)).getvalue()
+            attaches.append(Photo(raw=raw, name="photo.jpg"))
+        if message.video:
+            from pymax import Video
+            name = message.video.file_name or "video.mp4"
+            raw = (await ctx.bot.download(message.video.file_id)).getvalue()
+            attaches.append(Video(raw=raw, name=name))
+        if message.document:
+            from pymax import File
+            name = message.document.file_name or "file.bin"
+            raw = (await ctx.bot.download(message.document.file_id)).getvalue()
+            attaches.append(File(raw=raw, name=name))
+        if message.audio:
+            from pymax import File
+            name = message.audio.file_name or "audio.mp3"
+            raw = (await ctx.bot.download(message.audio.file_id)).getvalue()
+            attaches.append(File(raw=raw, name=name))
+        if message.voice:
+            from pymax import Voice
+            raw = (await ctx.bot.download(message.voice.file_id)).getvalue()
+            attaches.append(Voice(raw=raw, name="voice.ogg"))
+
+        # Forward
+        try:
+            if attaches:
+                for a in attaches:
+                    caption = text if a == attaches[0] else None
+                    await ctx.max_send_media(max_chat_id, a, caption=caption)
+            elif text:
+                await ctx.max_send(max_chat_id, text)
+        except Exception as exc:  # noqa: BLE001
+            log.error("Forward channel->MAX failed (channel=%s): %s", message.chat.id, exc)
 
     @dp.message(Command(commands=["presence"]))
     async def _cmd_presence(message: Message) -> None:
