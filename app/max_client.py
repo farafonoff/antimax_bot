@@ -87,9 +87,16 @@ def build_max_client(ctx: Context) -> Client:
     async def _on_message(message: Message, c: Client) -> None:
         chat_id = message.chat_id
         if chat_id is None:
+            log.info("MAX->TG: message without chat_id, skipping")
             return
 
         sender_id = message.sender
+        log.info("MAX->TG: received message chat_id=%s sender=%s text=%r", chat_id, sender_id, (message.text or "")[:50])
+
+        # Check if this is our own message (sent by the bot) - could be a roundtrip
+        # from the channel forwarder. We still process it because we want
+        # channel forwarder messages to come back to the linked TG topic.
+        # The TG->MAX handler prevents loops by skipping commands and bot messages.
         try:
             sender_name = await ctx.sender_name(sender_id, c)
         except Exception as exc:  # noqa: BLE001
@@ -100,6 +107,7 @@ def build_max_client(ctx: Context) -> Client:
         created = False
         if link is None:
             chat_title = ctx.name_for(chat_id, fallback=sender_name)
+            log.info("MAX->TG: no link for chat_id=%s, creating topic (title=%s)", chat_id, chat_title)
             try:
                 topic = await ctx.tg_create_topic(chat_title)
             except Exception as exc:  # noqa: BLE001
@@ -115,6 +123,7 @@ def build_max_client(ctx: Context) -> Client:
             )
         else:
             thread_id = link["tg_topic_id"]
+            log.info("MAX->TG: existing link for chat_id=%s -> topic=%s", chat_id, thread_id)
 
         text = message.text or ""
         attaches = message.attaches or []
