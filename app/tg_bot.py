@@ -393,45 +393,71 @@ def build_dispatcher(ctx: Context) -> Dispatcher:
         if forward is None:
             return
         if ctx.max_client is None or not ctx.max_ready.is_set():
+            log.warning("Channel forward: MAX not ready for chat %s", message.chat.id)
             return
 
         max_chat_id = forward["max_chat_id"]
+        log.info("Channel forward: TG channel %s -> MAX chat %s", message.chat.id, max_chat_id)
         text = message.text or message.caption or ""
-        attaches = []
+        
+        # Group photos into album (MAX supports multiple photos per message)
+        photo_attachments = []
+        other_attachments = []
 
-        # Handle media
         if message.photo:
             from pymax import Photo
             raw = (await ctx.bot.download(message.photo[-1].file_id)).getvalue()
-            attaches.append(Photo(raw=raw, name="photo.jpg"))
+            photo_attachments.append(Photo(raw=raw, name="photo.jpg"))
+        
+        # Handle other media types
         if message.video:
             from pymax import Video
             name = message.video.file_name or "video.mp4"
             raw = (await ctx.bot.download(message.video.file_id)).getvalue()
-            attaches.append(Video(raw=raw, name=name))
+            other_attachments.append(Video(raw=raw, name=name))
         if message.document:
             from pymax import File
             name = message.document.file_name or "file.bin"
             raw = (await ctx.bot.download(message.document.file_id)).getvalue()
-            attaches.append(File(raw=raw, name=name))
+            other_attachments.append(File(raw=raw, name=name))
         if message.audio:
             from pymax import File
             name = message.audio.file_name or "audio.mp3"
             raw = (await ctx.bot.download(message.audio.file_id)).getvalue()
-            attaches.append(File(raw=raw, name=name))
+            other_attachments.append(File(raw=raw, name=name))
         if message.voice:
             from pymax import Voice
             raw = (await ctx.bot.download(message.voice.file_id)).getvalue()
-            attaches.append(Voice(raw=raw, name="voice.ogg"))
+            other_attachments.append(Voice(raw=raw, name="voice.ogg"))
 
-        # Forward
+        # Send photos as album if multiple, otherwise with text
+        all_attachments = photo_attachments + other_attachments
         try:
-            if attaches:
-                for a in attaches:
-                    caption = text if a == attaches[0] else None
+            if photo_attachments and other_attachments:
+                # Send photos first as album, then others separately
+                await ctx.max_client.send_message(
+                    chat_id=max_chat_id,
+                    text=text,
+                    attachments=photo_attachments,
+                    notify=True
+                )
+                for a in other_attachments:
+                    await ctx.max_send_media(max_chat_id, a, caption=None)
+            elif photo_attachments:
+                # Multiple photos or single photo with text
+                await ctx.max_client.send_message(
+                    chat_id=max_chat_id,
+                    text=text,
+                    attachments=photo_attachments,
+                    notify=True
+                )
+            elif other_attachments:
+                for a in other_attachments:
+                    caption = text if a == other_attachments[0] else None
                     await ctx.max_send_media(max_chat_id, a, caption=caption)
             elif text:
                 await ctx.max_send(max_chat_id, text)
+            log.info("Channel forward: sent to MAX chat %s", max_chat_id)
         except Exception as exc:  # noqa: BLE001
             log.error("Forward channel->MAX failed (channel=%s): %s", message.chat.id, exc)
 
