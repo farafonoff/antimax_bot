@@ -502,7 +502,11 @@ class Context:
         )
 
     async def tg_reply(self, message: Any, text: str):
-        return await message.reply(text, parse_mode=ParseMode.HTML, allow_sending_without_reply=True)
+        try:
+            return await message.reply(text, parse_mode=ParseMode.HTML, allow_sending_without_reply=True)
+        except Exception as exc:  # noqa: BLE001
+            log.error("tg_reply failed: %s", exc)
+            raise
 
     # ---- MAX-side gateway -----------------------------------------------
     async def max_send(self, max_chat_id, text: str) -> None:
