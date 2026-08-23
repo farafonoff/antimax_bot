@@ -483,11 +483,14 @@ def build_dispatcher(ctx: Context) -> Dispatcher:
             return
         tid = _real_topic(message, ctx)
         if tid is None:
-            return  # General topic: no MAX binding
+            log.debug("TG->MAX: message in General topic (tid=None), skipping")
+            return
         link = await ctx.db.aget_link_by_topic(tid)
         if link is None:
-            return  # unlinked topic
+            log.warning("TG->MAX: topic %s not linked to any MAX chat", tid)
+            return
         if ctx.max_client is None or not ctx.max_ready.is_set():
+            log.warning("TG->MAX: MAX not ready, dropping message")
             return
 
         sender_name = message.from_user.full_name if message.from_user else "Telegram"
@@ -501,9 +504,17 @@ def build_dispatcher(ctx: Context) -> Dispatcher:
             progress = None
 
         try:
+            # Handle media groups (albums) - collect all attachments
+            attaches = []
+            if message.media_group_id:
+                # For albums, we'd need to collect from multiple messages
+                # For now, process this message's media
+                pass
+            
             attach = await _build_max_attach(message)
             if attach is None and not text:
-                return  # nothing forwardable (sticker/animation/editing)
+                log.debug("TG->MAX: no forwardable content (sticker/animation/editing)")
+                return
             if attach is not None:
                 caption = f"{sender_name}:\n\n{text}" if text else None
                 await ctx.max_send_media(max_chat, attach, caption=caption)
