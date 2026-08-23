@@ -507,6 +507,23 @@ def build_dispatcher(ctx: Context) -> Dispatcher:
             elif text:
                 await ctx.max_send(max_chat_id, text)
             log.info("Channel forward: sent to MAX chat %s", max_chat_id)
+
+            # Also forward to linked TG topic (since own messages don't trigger on_message)
+            link = await ctx.db.aget_link(max_chat_id)
+            if link is not None:
+                thread_id = link["tg_topic_id"]
+                try:
+                    await ctx.bot.copy_message(
+                        chat_id=ctx.group_id,
+                        message_thread_id=thread_id,
+                        from_chat_id=message.chat.id,
+                        message_id=message.message_id,
+                    )
+                    log.info("Channel forward: copied to TG topic %s", thread_id)
+                except Exception as exc:  # noqa: BLE001
+                    log.error("Channel forward to TG topic %s failed: %s", thread_id, exc)
+            else:
+                log.info("Channel forward: no TG topic linked for MAX chat %s", max_chat_id)
         except Exception as exc:  # noqa: BLE001
             log.error("Forward channel->MAX failed (channel=%s): %s", message.chat.id, exc)
 
