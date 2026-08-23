@@ -439,6 +439,22 @@ class Context:
             )
         )
 
+    async def tg_send_media_group(
+        self, thread_id: int, urls: list[str], caption_html: str | None = None
+    ):
+        from aiogram.types import InputMediaPhoto
+        media = [InputMediaPhoto(media=u) for u in urls]
+        if caption_html:
+            media[0].caption = caption_html
+            media[0].parse_mode = ParseMode.HTML
+        return await self._safe(
+            lambda: self.bot.send_media_group(
+                chat_id=self.group_id,
+                media=media,
+                message_thread_id=thread_id,
+            )
+        )
+
     async def tg_reply(self, message: Any, text: str):
         return await message.reply(text, parse_mode=ParseMode.HTML, allow_sending_without_reply=True)
 

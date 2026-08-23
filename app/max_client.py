@@ -127,7 +127,10 @@ def build_max_client(ctx: Context) -> Client:
         sent = False
         if photos:
             caption = (header + text) if text else None
-            await ctx.tg_send_photo(thread_id, photos[0], caption_html=caption)
+            if len(photos) == 1:
+                await ctx.tg_send_photo(thread_id, photos[0], caption_html=caption)
+            else:
+                await ctx.tg_send_media_group(thread_id, photos, caption_html=caption)
             sent = True
         if text and not photos:
             await ctx.tg_post(thread_id, header + text)
