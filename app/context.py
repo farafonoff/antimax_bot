@@ -455,6 +455,50 @@ class Context:
             )
         )
 
+    async def tg_send_video(self, thread_id: int, url: str, thumbnail: str | None = None, caption_html: str | None = None):
+        return await self._safe(
+            lambda: self.bot.send_video(
+                chat_id=self.group_id,
+                video=url,
+                thumbnail=thumbnail,
+                caption=caption_html,
+                message_thread_id=thread_id,
+                parse_mode=ParseMode.HTML,
+            )
+        )
+
+    async def tg_send_audio(self, thread_id: int, url: str, caption_html: str | None = None):
+        return await self._safe(
+            lambda: self.bot.send_audio(
+                chat_id=self.group_id,
+                audio=url,
+                caption=caption_html,
+                message_thread_id=thread_id,
+                parse_mode=ParseMode.HTML,
+            )
+        )
+
+    async def tg_send_document(self, thread_id: int, url: str, filename: str | None = None, caption_html: str | None = None):
+        return await self._safe(
+            lambda: self.bot.send_document(
+                chat_id=self.group_id,
+                document=url,
+                filename=filename,
+                caption=caption_html,
+                message_thread_id=thread_id,
+                parse_mode=ParseMode.HTML,
+            )
+        )
+
+    async def tg_send_sticker(self, thread_id: int, url: str):
+        return await self._safe(
+            lambda: self.bot.send_sticker(
+                chat_id=self.group_id,
+                sticker=url,
+                message_thread_id=thread_id,
+            )
+        )
+
     async def tg_reply(self, message: Any, text: str):
         return await message.reply(text, parse_mode=ParseMode.HTML, allow_sending_without_reply=True)
 

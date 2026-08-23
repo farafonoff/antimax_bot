@@ -1,5 +1,5 @@
 from pymax import Client, Message, PresenceEvent, ExtraConfig, SyncOverrides
-from pymax.types import PhotoAttachment
+from pymax.types import PhotoAttachment, VideoAttachment, AudioAttachment, FileAttachment, StickerAttachment
 
 from app.logger import log
 from app.context import Context
@@ -122,17 +122,57 @@ def build_max_client(ctx: Context) -> Client:
             a.base_url for a in attaches
             if isinstance(a, PhotoAttachment) and getattr(a, "base_url", None)
         ]
+        videos = [
+            a for a in attaches
+            if isinstance(a, VideoAttachment) and getattr(a, "thumbnail", None)
+        ]
+        audios = [
+            a for a in attaches
+            if isinstance(a, AudioAttachment) and getattr(a, "url", None)
+        ]
+        files = [
+            a for a in attaches
+            if isinstance(a, FileAttachment) and getattr(a, "token", None)
+        ]
+        stickers = [
+            a for a in attaches
+            if isinstance(a, StickerAttachment) and getattr(a, "url", None)
+        ]
 
         header = f"<b>{sender_name}</b> <code>{sender_id}</code>{ctx.with_presence(sender_id)}:\n\n"
         sent = False
+        caption = (header + text) if text else None
+
         if photos:
-            caption = (header + text) if text else None
             if len(photos) == 1:
                 await ctx.tg_send_photo(thread_id, photos[0], caption_html=caption)
             else:
                 await ctx.tg_send_media_group(thread_id, photos, caption_html=caption)
             sent = True
-        if text and not photos:
+
+        for v in videos:
+            await ctx.tg_send_video(thread_id, v.thumbnail, caption_html=caption)
+            sent = True
+            caption = None  # only caption on first media
+
+        for a in audios:
+            await ctx.tg_send_audio(thread_id, a.url, caption_html=caption)
+            sent = True
+            caption = None
+
+        for f in files:
+            # FileAttachment has token; need to construct download URL
+            # MAX uses token for download: https://max-api.vk.com/attachments/download/<token>?format=json
+            download_url = f"https://max-api.vk.com/attachments/download/{f.token}?format=json"
+            await ctx.tg_send_document(thread_id, download_url, filename=f.name, caption_html=caption)
+            sent = True
+            caption = None
+
+        for s in stickers:
+            await ctx.tg_send_sticker(thread_id, s.url)
+            sent = True
+
+        if text and not sent:
             await ctx.tg_post(thread_id, header + text)
             sent = True
         if not sent:
