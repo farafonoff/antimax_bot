@@ -4,6 +4,15 @@ from pymax.types import PhotoAttachment, VideoAttachment, AudioAttachment, FileA
 from app.logger import log
 from app.context import Context
 
+MAX_NO_FORWARD_TAG = "#frommax"
+
+
+def _inject_no_forward_tag(text: str, sent: bool) -> str:
+    """Append the no-forward tag if something was already sent."""
+    if sent:
+        return f"{text}\n\n{MAX_NO_FORWARD_TAG}"
+    return text
+
 
 def build_max_client(ctx: Context) -> Client:
     client = Client(
@@ -153,6 +162,7 @@ def build_max_client(ctx: Context) -> Client:
         caption = (header + text) if text else None
 
         if photos:
+            caption = _inject_no_forward_tag(caption or "", sent) if caption else None
             if len(photos) == 1:
                 await ctx.tg_send_photo(thread_id, photos[0], caption_html=caption)
             else:
@@ -160,18 +170,19 @@ def build_max_client(ctx: Context) -> Client:
             sent = True
 
         for v in videos:
+            caption = _inject_no_forward_tag(caption or "", sent) if caption else None
             await ctx.tg_send_video(thread_id, v.thumbnail, caption_html=caption)
             sent = True
             caption = None  # only caption on first media
 
         for a in audios:
+            caption = _inject_no_forward_tag(caption or "", sent) if caption else None
             await ctx.tg_send_audio(thread_id, a.url, caption_html=caption)
             sent = True
             caption = None
 
         for f in files:
-            # FileAttachment has token; need to construct download URL
-            # MAX uses token for download: https://max-api.vk.com/attachments/download/<token>?format=json
+            caption = _inject_no_forward_tag(caption or "", sent) if caption else None
             download_url = f"https://max-api.vk.com/attachments/download/{f.token}?format=json"
             await ctx.tg_send_document(thread_id, download_url, caption_html=caption)
             sent = True
@@ -182,10 +193,10 @@ def build_max_client(ctx: Context) -> Client:
             sent = True
 
         if text and not sent:
-            await ctx.tg_post(thread_id, header + text)
+            await ctx.tg_post(thread_id, _inject_no_forward_tag(header + text, sent))
             sent = True
         if not sent:
-            await ctx.tg_post(thread_id, header + "<i>(вложение без текста)</i>")
+            await ctx.tg_post(thread_id, _inject_no_forward_tag(header + "<i>(вложение без текста)</i>", sent))
 
         if created:
             log.info("MAX msg chat=%s (new) -> tg topic=%s", chat_id, thread_id)

@@ -7,6 +7,7 @@ from pymax import Photo, Video, Voice, File
 
 from app.context import Context
 from app.logger import log
+from app.max_client import MAX_NO_FORWARD_TAG
 
 
 def _is_owner(message: Message, ctx: Context) -> bool:
@@ -579,6 +580,10 @@ def build_dispatcher(ctx: Context) -> Dispatcher:
         if message.text and message.text.startswith("/"):
             return
         if ctx.bot_id and message.from_user and message.from_user.id == ctx.bot_id:
+            return
+        # Skip messages that came from MAX (roundtrip protection)
+        if message.text and MAX_NO_FORWARD_TAG in message.text:
+            log.info("TG->MAX: skipping message with %s tag (from MAX)", MAX_NO_FORWARD_TAG)
             return
         tid = _real_topic(message, ctx)
         if tid is None:
