@@ -344,6 +344,31 @@ def build_dispatcher(ctx: Context) -> Dispatcher:
             lines.append(f"<code>{f['tg_channel_id']}</code> → <code>{f['max_chat_id']}</code> ({name})")
         await ctx.tg_reply(message, "\n".join(lines))
 
+    @dp.message(Command(commands=["debug_forward"]))
+    async def _cmd_debug_forward(message: Message) -> None:
+        if not (_is_owner(message, ctx) and _in_group(message, ctx)):
+            return
+        tid = _real_topic(message, ctx)
+        if tid is None:
+            await ctx.tg_reply(message, "Вы в General теме — форвардинг не работает здесь.")
+            return
+        link = await ctx.db.aget_link_by_topic(tid)
+        if link is None:
+            await ctx.tg_reply(message, f"Тема <code>{tid}</code> не привязана к MAX чату.")
+            return
+        await ctx.tg_reply(
+            message,
+            f"✅ Тема <code>{tid}</code> → MAX чат <code>{link['max_chat_id']}</code>\n"
+            f"MAX ready: {ctx.max_ready.is_set()}\n"
+            f"MAX client: {'есть' if ctx.max_client else 'нет'}"
+        )
+        # Test send
+        try:
+            await ctx.max_send(link["max_chat_id"], "🔧 Тестовый форвард из TG (debug)")
+            await ctx.tg_reply(message, "Тестовое сообщение отправлено в MAX.")
+        except Exception as exc:
+            await ctx.tg_reply(message, f"❌ Ошибка теста: {exc}")
+
     @dp.message(Command(commands=["unlink"]))
     async def _cmd_unlink(message: Message) -> None:
         if not (_is_owner(message, ctx) and _in_group(message, ctx)):
