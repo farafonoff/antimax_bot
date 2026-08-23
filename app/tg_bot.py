@@ -33,6 +33,10 @@ def build_dispatcher(ctx: Context) -> Dispatcher:
     async def _cmd_help(message: Message) -> None:
         if not (_in_group(message, ctx) and _is_owner(message, ctx)):
             return
+        log.info("TG command: /help from user=%s in chat=%s thread=%s", 
+                 message.from_user.id if message.from_user else None,
+                 message.chat.id if message.chat else None,
+                 message.message_thread_id)
         txt = (
             "🔗 <b>MAX ↔ Telegram bridge</b>\n\n"
             "<b>1. MAX → Telegram (входящие сообщения)</b>\n"
