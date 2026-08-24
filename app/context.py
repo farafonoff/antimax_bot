@@ -259,8 +259,9 @@ class Context:
             try:
                 now = time.time()
                 if now - last_fetch >= PRESENCE_POLL_INTERVAL:
-                    await self.fetch_presence_map()
-                    self._presence_dirty = True
+                    if self.max_ready.is_set():
+                        await self.fetch_presence_map()
+                        self._presence_dirty = True
                     last_fetch = now
                 if self._presence_dirty or now - self._presence_last_edit >= PRESENCE_EDIT_INTERVAL:
                     try:
