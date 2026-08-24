@@ -264,13 +264,15 @@ class Context:
                         self._presence_dirty = True
                     last_fetch = now
                 if self._presence_dirty or now - self._presence_last_edit >= PRESENCE_EDIT_INTERVAL:
+                    if not self.max_ready.is_set():
+                        await asyncio.sleep(15)
+                        continue
                     try:
                         await self._update_presence_live_message()
                         self._presence_dirty = False
                         self._presence_last_edit = time.time()
                     except TelegramBadRequest as exc:
                         if "message thread not found" in str(exc).lower():
-                            # topic was deleted in Telegram -> recreate it
                             log.warning("presence topic deleted; recreating")
                             await self._invalidate_presence_topic()
                             await self._update_presence_live_message()
