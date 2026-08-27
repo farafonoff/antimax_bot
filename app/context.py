@@ -300,10 +300,16 @@ class Context:
 
     async def _build_presence_snapshot_text(self) -> str:
         stamp = self._fmt_time(time.time()) or ""
-        head = f"<b>MAX presence</b> · <code>{stamp}</code>"
-        if not self.presence:
-            return f"{head}\n<i>нет данных о контактах</i>"
-        lines = [head]
+        if not self.max_ready.is_set():
+            head = f"🔴 <b>MAX presence · ОТКЛЮЧЁН</b> · <code>{stamp}</code>"
+            if not self.presence:
+                return f"{head}\n<i>нет кэша (MAX отключён)</i>"
+            lines = [head, "<i>показан последний кэш:</i>"]
+        else:
+            head = f"<b>MAX presence</b> · <code>{stamp}</code>"
+            if not self.presence:
+                return f"{head}\n<i>нет данных о контактах</i>"
+            lines = [head]
         for uid in sorted(self.presence.keys()):
             name = await self.resolve_user_name(uid)
             pstr = self.presence_str(uid) or "нет данных"

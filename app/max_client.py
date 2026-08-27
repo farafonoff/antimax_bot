@@ -79,6 +79,10 @@ def build_max_client(ctx: Context) -> Client:
         # silently retrying for minutes.
         ctx.max_disconnected = True
         ctx.max_ready.clear()
+        # Clear stale presence cache so we don't show misleading "last seen"
+        # while MAX is disconnected.
+        ctx.presence.clear()
+        ctx._presence_dirty = True  # force refresh on reconnect
         log.warning("MAX disconnected: %s (reconnect=%s in %ss)", exception, reconnect, delay)
         await ctx.note_connectivity(
             "⚠️ MAX связь потеряна с сервером; пытаюсь переподключиться…"
