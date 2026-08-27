@@ -4,7 +4,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from app.logger import log, get_logger
+from app.logger import get_logger
 
 BASE = Path(__file__).resolve().parent.parent
 _env_path = BASE / ".env"

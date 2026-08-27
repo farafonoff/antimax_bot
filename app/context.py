@@ -165,8 +165,8 @@ class Context:
             links = await self.db.alist_links()
         except Exception:  # noqa: BLE001
             links = []
-        for l in links:
-            mid = self.db.coerce_chat_id(l["max_chat_id"])
+        for link in links:
+            mid = self.db.coerce_chat_id(link["max_chat_id"])
             if not isinstance(mid, int):
                 continue
             # 1:1 chat: max_chat_id IS the counterpart user id.
@@ -176,7 +176,7 @@ class Context:
                 uids.add(mid)
         return uids
 
-    async def fetch_presence_map(self, extra_uids: Optional[set[int]] = None) -> dict[int, Any]:
+    async def fetch_presence_map(self, extra_uids: Optional[set[int]] = None) -> Optional[dict[int, Any]]:
         """Pull the full presence map via the CONTACT_PRESENCE request (opcode 35).
 
         MAX has no public per-user presence RPC and PyMax doesn't wrap this
@@ -186,16 +186,23 @@ class Context:
         Cache invalidation: only presence for *linked* 1:1 peers (plus any
         explicitly-requested ``extra_uids`` from /presence queries) is cached;
         everything else is pruned so stale entries don't linger.
+
+        Returns ``None`` if MAX was never actually contacted (no client yet,
+        no known peer to query through, or the request itself failed) so
+        callers -- notably the watchdog's staleness check -- can tell "we
+        tried and it worked" apart from "we didn't really try". Only a
+        genuine response (even with an empty/malformed payload) counts as
+        contact.
         """
 
         client = self.max_client
         if client is None or self.self_user_id is None:
-            return {}
+            return None
         # The request needs a known contact_id; any dialog peer works and the
         # server returns presence for all contacts in the response.
         peer = next(iter(self.dialog_user_to_chat.keys()), None)
         if peer is None:
-            return {}
+            return None
         try:
             from pymax.protocol import Opcode
             resp = await client._app.invoke(
@@ -205,7 +212,7 @@ class Context:
             )
         except Exception as exc:  # noqa: BLE001
             log.debug("CONTACT_PRESENCE failed: %s", exc)
-            return {}
+            return None
         payload = getattr(resp, "payload", None) or {}
         raw = payload.get("presence") or {}
         if not isinstance(raw, dict):
@@ -261,8 +268,13 @@ class Context:
                 now = time.time()
                 if now - last_fetch >= PRESENCE_POLL_INTERVAL:
                     if self.max_ready.is_set():
-                        await self.fetch_presence_map()
-                        self._last_presence_update = time.time()  # track successful fetch
+                        result = await self.fetch_presence_map()
+                        if result is not None:
+                            # Only stamp this on an actual contact -- the
+                            # watchdog relies on it going stale when MAX
+                            # stops responding, which it can't do if this is
+                            # bumped regardless of whether anything happened.
+                            self._last_presence_update = time.time()
                         self._presence_dirty = True
                     last_fetch = now
                 if self._presence_dirty or now - self._presence_last_edit >= PRESENCE_EDIT_INTERVAL:
@@ -457,10 +469,17 @@ class Context:
         self, thread_id: int, urls: list[str], caption_html: str | None = None
     ):
         from aiogram.types import InputMediaPhoto
-        media = [InputMediaPhoto(media=u) for u in urls]
-        if caption_html:
-            media[0].caption = caption_html
-            media[0].parse_mode = ParseMode.HTML
+        # InputMediaPhoto is a frozen pydantic model -- caption/parse_mode
+        # must be set at construction, not assigned afterwards (that raises
+        # ValidationError: Instance is frozen).
+        media = [
+            InputMediaPhoto(
+                media=u,
+                caption=caption_html if i == 0 else None,
+                parse_mode=ParseMode.HTML if i == 0 and caption_html else None,
+            )
+            for i, u in enumerate(urls)
+        ]
         return await self._safe(
             lambda: self.bot.send_media_group(
                 chat_id=self.group_id,

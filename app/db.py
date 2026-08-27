@@ -2,8 +2,6 @@ import asyncio
 import sqlite3
 from pathlib import Path
 
-from app.logger import log
-
 
 class LinksDB:
     """Persisted mapping: MAX chat_id  <->  Telegram forum topic (message_thread_id)."""
@@ -48,6 +46,25 @@ class LinksDB:
                 con.commit()
             except sqlite3.OperationalError:
                 pass  # column already exists
+            # Channel posts queued while MAX was disconnected, to be replayed
+            # on reconnect. There's no Bot API to retroactively fetch a
+            # channel's history, so posts that arrive live (via channel_post
+            # updates, independent of MAX's state) are persisted here instead
+            # of being dropped.
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pending_forwards (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tg_channel_id   INTEGER NOT NULL,
+                    tg_message_id   INTEGER NOT NULL,
+                    text            TEXT,
+                    media_kind      TEXT,
+                    media_file_id   TEXT,
+                    media_file_name TEXT,
+                    created_at      REAL DEFAULT (strftime('%s','now'))
+                )
+                """
+            )
 
     @staticmethod
     def coerce_chat_id(raw: str):
@@ -122,6 +139,10 @@ class LinksDB:
             con.execute(
                 "DELETE FROM channel_forwards WHERE tg_channel_id = ?", (tg_channel_id,)
             )
+            # Don't leave orphaned queued posts behind for a removed forward.
+            con.execute(
+                "DELETE FROM pending_forwards WHERE tg_channel_id = ?", (tg_channel_id,)
+            )
             con.commit()
 
     def list_forwards(self) -> list[dict]:
@@ -141,10 +162,49 @@ class LinksDB:
 
     def set_forward_last_msg_id(self, tg_channel_id: int, msg_id: int) -> None:
         with self._connect() as con:
+            # Monotonic on purpose: the live channel_post handler and a
+            # replay pass can both write this for the same channel, and
+            # asyncio gives no ordering guarantee between them. A plain
+            # overwrite could regress the watermark backward if the write
+            # for a newer message happens to land first, which would make
+            # the next replay re-send messages that were already delivered.
             con.execute(
-                "UPDATE channel_forwards SET last_msg_id = ? WHERE tg_channel_id = ?",
-                (msg_id, tg_channel_id),
+                "UPDATE channel_forwards SET last_msg_id = ? "
+                "WHERE tg_channel_id = ? AND last_msg_id < ?",
+                (msg_id, tg_channel_id, msg_id),
             )
+            con.commit()
+
+    # posts queued while MAX was disconnected
+    def add_pending_forward(
+        self,
+        tg_channel_id: int,
+        tg_message_id: int,
+        text: str,
+        media_kind: str | None = None,
+        media_file_id: str | None = None,
+        media_file_name: str | None = None,
+    ) -> None:
+        with self._connect() as con:
+            con.execute(
+                "INSERT INTO pending_forwards "
+                "(tg_channel_id, tg_message_id, text, media_kind, media_file_id, media_file_name) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (tg_channel_id, tg_message_id, text, media_kind, media_file_id, media_file_name),
+            )
+            con.commit()
+
+    def list_pending_forwards(self, tg_channel_id: int) -> list[dict]:
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT * FROM pending_forwards WHERE tg_channel_id = ? ORDER BY tg_message_id ASC",
+                (tg_channel_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def del_pending_forward(self, pending_id: int) -> None:
+        with self._connect() as con:
+            con.execute("DELETE FROM pending_forwards WHERE id = ?", (pending_id,))
             con.commit()
 
     # async wrappers
@@ -180,3 +240,23 @@ class LinksDB:
 
     async def aset_forward_last_msg_id(self, tg_channel_id: int, msg_id: int) -> None:
         await asyncio.to_thread(self.set_forward_last_msg_id, tg_channel_id, msg_id)
+
+    async def aadd_pending_forward(
+        self,
+        tg_channel_id: int,
+        tg_message_id: int,
+        text: str,
+        media_kind: str | None = None,
+        media_file_id: str | None = None,
+        media_file_name: str | None = None,
+    ) -> None:
+        await asyncio.to_thread(
+            self.add_pending_forward,
+            tg_channel_id, tg_message_id, text, media_kind, media_file_id, media_file_name,
+        )
+
+    async def alist_pending_forwards(self, tg_channel_id: int) -> list[dict]:
+        return await asyncio.to_thread(self.list_pending_forwards, tg_channel_id)
+
+    async def adel_pending_forward(self, pending_id: int) -> None:
+        await asyncio.to_thread(self.del_pending_forward, pending_id)

@@ -2,6 +2,7 @@ import asyncio
 import os
 import signal
 import sys
+import time
 
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
@@ -14,7 +15,7 @@ from app.db import LinksDB
 from app.logger import log
 from app.max_client import build_max_client
 from app.sms_provider import SmsInbox
-from app.tg_bot import build_dispatcher, _replay_channel_forward
+from app.tg_bot import build_dispatcher, replay_channel_forward
 from app.tg_logs import start_tg_log_worker
 
 
@@ -30,58 +31,95 @@ STUCK_WATCHDOG_INTERVAL = 60         # check for stuck connection every 60s
 STUCK_THRESHOLD = 120                # consider stuck if no presence update for 120s
 
 
+async def _run_max_cycle(ctx: Context, backoff: int) -> int:
+    """One connect/serve/reconnect cycle of the MAX client.
+
+    `client.start()` blocks for as long as the connection is alive, so this
+    single call *is* one full cycle. Returns the backoff to use for the next
+    cycle so the caller's loop can just do `backoff = await _run_max_cycle(...)`.
+    """
+    client = ctx.max_client
+    try:
+        await client.start()
+        log.warning("MAX client stopped cleanly; restarting in %ss", backoff)
+        # Clean exit still leaves the runtime closed -> rebuild below.
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        log.exception("MAX client crashed: %s; restarting", exc)
+        ctx.max_disconnected = True
+        ctx.max_ready.clear()
+
+        # Detect specific error codes for tailored cooldowns
+        from pymax.exceptions import ApiError
+        error_code = exc.error if isinstance(exc, ApiError) else None
+
+        if error_code == "error.code.attempt.limit":
+            # MAX: too many attempts for this code request
+            delay = ATTEMPT_LIMIT_COOLDOWN
+            reason = "превышен лимит попыток для кода"
+        elif ctx.sms.state.value != "idle":
+            # Other auth failure (wrong/expired code)
+            delay = AUTH_FAILURE_COOLDOWN
+            reason = "ошибка авторизации"
+        else:
+            # Transport / other error
+            delay = backoff
+            reason = "ошибка соединения"
+
+        ctx.sms.reset()  # auth flow died; next get_code starts fresh
+
+        try:
+            await ctx.note_connectivity(
+                f"❌ MAX клиент упал: <code>{exc}</code>\n"
+                f"{reason} — запрашу новый SMS-код через {delay}s…"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+        await asyncio.sleep(delay)
+        backoff = min(backoff * 2, 300) if delay == backoff else 5
+    else:
+        await asyncio.sleep(backoff)
+    try:
+        await client.close()
+    except Exception:  # noqa: BLE001
+        pass
+    # pymax runtime is unusable after close(); rebuild from scratch.
+    ctx.max_client = build_max_client(ctx)
+    return backoff
+
+
 async def run_max(ctx: Context) -> None:
     backoff = 5
     while True:
-        client = ctx.max_client
+        backoff = await _run_max_cycle(ctx, backoff)
+
+
+async def _replay_all_forwards(ctx: Context) -> None:
+    """Replay every configured channel forward; one failure doesn't stop the rest."""
+    log.info("MAX reconnected, starting channel forward replay")
+    forwards = await ctx.db.alist_forwards()
+    for fwd in forwards:
+        tg_channel_id = fwd["tg_channel_id"]
         try:
-            await client.start()
-            log.warning("MAX client stopped cleanly; restarting in %ss", backoff)
-            # Clean exit still leaves the runtime closed -> rebuild below.
-        except asyncio.CancelledError:
-            raise
+            await replay_channel_forward(ctx, tg_channel_id)
         except Exception as exc:  # noqa: BLE001
-            log.exception("MAX client crashed: %s; restarting", exc)
-            ctx.max_disconnected = True
-            ctx.max_ready.clear()
+            log.error("Replay failed for channel %s: %s", tg_channel_id, exc)
+        await asyncio.sleep(1)
 
-            # Detect specific error codes for tailored cooldowns
-            from pymax.exceptions import ApiError
-            error_code = exc.error if isinstance(exc, ApiError) else None
 
-            if error_code == "error.code.attempt.limit":
-                # MAX: too many attempts for this code request
-                delay = ATTEMPT_LIMIT_COOLDOWN
-                reason = "превышен лимит попыток для кода"
-            elif ctx.sms.state.value != "idle":
-                # Other auth failure (wrong/expired code)
-                delay = AUTH_FAILURE_COOLDOWN
-                reason = "ошибка авторизации"
-            else:
-                # Transport / other error
-                delay = backoff
-                reason = "ошибка соединения"
-
-            ctx.sms.reset()  # auth flow died; next get_code starts fresh
-
-            try:
-                await ctx.note_connectivity(
-                    f"❌ MAX клиент упал: <code>{exc}</code>\n"
-                    f"{reason} — запрашу новый SMS-код через {delay}s…"
-                )
-            except Exception:  # noqa: BLE001
-                pass
-
-            await asyncio.sleep(delay)
-            backoff = min(backoff * 2, 300) if delay == backoff else 5
-        else:
-            await asyncio.sleep(backoff)
-        try:
-            await client.close()
-        except Exception:  # noqa: BLE001
-            pass
-        # pymax runtime is unusable after close(); rebuild from scratch.
-        ctx.max_client = build_max_client(ctx)
+async def _reconnect_replay_tick(ctx: Context, was_disconnected: bool) -> bool:
+    """One poll tick: detect MAX transitioning not-ready -> ready and trigger
+    a replay pass. Returns the updated `was_disconnected` state."""
+    if ctx.max_client is None:
+        return was_disconnected
+    if not ctx.max_ready.is_set():
+        return True
+    if was_disconnected:
+        await _replay_all_forwards(ctx)
+        return False
+    return was_disconnected
 
 
 async def run_replay_on_reconnect(ctx: Context) -> None:
@@ -89,43 +127,38 @@ async def run_replay_on_reconnect(ctx: Context) -> None:
     was_disconnected = False
     while True:
         await asyncio.sleep(30)
-        if ctx.max_client is None:
-            continue
-        if not ctx.max_ready.is_set():
-            was_disconnected = True
-            continue
-        if was_disconnected:
-            log.info("MAX reconnected, starting channel forward replay")
-            # Get all forwards
-            forwards = await ctx.db.alist_forwards()
-            for fwd in forwards:
-                tg_channel_id = fwd["tg_channel_id"]
-                try:
-                    await _replay_channel_forward(ctx, tg_channel_id)
-                except Exception as exc:  # noqa: BLE001
-                    log.error("Replay failed for channel %s: %s", tg_channel_id, exc)
-                await asyncio.sleep(1)
-            was_disconnected = False
+        was_disconnected = await _reconnect_replay_tick(ctx, was_disconnected)
+
+
+async def _watchdog_tick(ctx: Context) -> None:
+    """One check: if MAX is 'ready' but hasn't produced a presence update in
+    STUCK_THRESHOLD seconds, the transport is likely stuck silently -> force
+    a restart so run_max's reconnect logic kicks in."""
+    if ctx.max_client is None or not ctx.max_ready.is_set():
+        return
+    # Use the tracked timestamp from presence poll
+    if ctx._last_presence_update > 0:
+        now = time.time()
+        if now - ctx._last_presence_update > STUCK_THRESHOLD:
+            log.warning(
+                "Watchdog: MAX connection appears stuck (no presence update for %ds), forcing restart",
+                STUCK_THRESHOLD,
+            )
+            try:
+                await ctx.max_client.stop()
+            except Exception as exc:  # noqa: BLE001
+                log.debug("watchdog stop failed: %s", exc)
+            # Reset timestamp so we don't spam restarts
+            ctx._last_presence_update = 0
+
+
+async def run_watchdog(ctx: Context) -> None:
     """Watch for stuck MAX connection (transport failing but max_ready=True).
     If presence hasn't updated in STUCK_THRESHOLD seconds while ready,
     force a client restart to trigger proper reconnection."""
     while True:
         await asyncio.sleep(STUCK_WATCHDOG_INTERVAL)
-        
-        if ctx.max_client is None or not ctx.max_ready.is_set():
-            continue
-            
-        # Use the tracked timestamp from presence poll
-        if ctx._last_presence_update > 0:
-            now = asyncio.get_event_loop().time()
-            if now - ctx._last_presence_update > STUCK_THRESHOLD:
-                log.warning("Watchdog: MAX connection appears stuck (no presence update for %ds), forcing restart", STUCK_THRESHOLD)
-                try:
-                    await ctx.max_client.stop()
-                except Exception as exc:  # noqa: BLE001
-                    log.debug("watchdog stop failed: %s", exc)
-                # Reset timestamp so we don't spam restarts
-                ctx._last_presence_update = 0
+        await _watchdog_tick(ctx)
 
 
 async def run_tg(ctx: Context) -> None:
