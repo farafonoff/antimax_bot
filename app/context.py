@@ -55,6 +55,7 @@ class Context:
         self._presence_live_msg_id: Optional[int] = None
         self._presence_dirty: bool = True  # something changed -> edit soon
         self._presence_last_edit: float = 0.0
+        self._last_presence_update: float = 0.0  # timestamp of last successful fetch_presence_map
         self.self_user_id: Optional[int] = None
         self.max_owner_name: str = "MAX"
         self.bot_id: Optional[int] = None
@@ -261,6 +262,7 @@ class Context:
                 if now - last_fetch >= PRESENCE_POLL_INTERVAL:
                     if self.max_ready.is_set():
                         await self.fetch_presence_map()
+                        self._last_presence_update = time.time()  # track successful fetch
                         self._presence_dirty = True
                     last_fetch = now
                 if self._presence_dirty or now - self._presence_last_edit >= PRESENCE_EDIT_INTERVAL:

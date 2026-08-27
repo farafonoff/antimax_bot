@@ -26,6 +26,8 @@ def _ensure_dirs(settings):
 TOKEN_ROTATE_INTERVAL = 12 * 3600  # periodic re-login rotates the MAX token
 AUTH_FAILURE_COOLDOWN = 180          # pause before asking MAX for a fresh SMS code
 ATTEMPT_LIMIT_COOLDOWN = 300         # longer pause when MAX says "attempt limit reached"
+STUCK_WATCHDOG_INTERVAL = 60         # check for stuck connection every 60s
+STUCK_THRESHOLD = 120                # consider stuck if no presence update for 120s
 
 
 async def run_max(ctx: Context) -> None:
@@ -82,17 +84,27 @@ async def run_max(ctx: Context) -> None:
         ctx.max_client = build_max_client(ctx)
 
 
-async def run_token_rotation(ctx: Context) -> None:
-    """Re-login periodically: MAX rotates the token on every login, which is
-    the only refresh mechanism available. Prevents slow server-side expiry."""
+async def run_watchdog(ctx: Context) -> None:
+    """Watch for stuck MAX connection (transport failing but max_ready=True).
+    If presence hasn't updated in STUCK_THRESHOLD seconds while ready,
+    force a client restart to trigger proper reconnection."""
     while True:
-        await asyncio.sleep(TOKEN_ROTATE_INTERVAL)
-        if ctx.max_client is not None and ctx.max_ready.is_set():
-            log.info("scheduled MAX re-login (token rotation)")
-            try:
-                await ctx.max_client.stop()
-            except Exception as exc:  # noqa: BLE001
-                log.debug("token rotation stop failed: %s", exc)
+        await asyncio.sleep(STUCK_WATCHDOG_INTERVAL)
+        
+        if ctx.max_client is None or not ctx.max_ready.is_set():
+            continue
+            
+        # Use the tracked timestamp from presence poll
+        if ctx._last_presence_update > 0:
+            now = asyncio.get_event_loop().time()
+            if now - ctx._last_presence_update > STUCK_THRESHOLD:
+                log.warning("Watchdog: MAX connection appears stuck (no presence update for %ds), forcing restart", STUCK_THRESHOLD)
+                try:
+                    await ctx.max_client.stop()
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("watchdog stop failed: %s", exc)
+                # Reset timestamp so we don't spam restarts
+                ctx._last_presence_update = 0
 
 
 async def run_tg(ctx: Context) -> None:
@@ -146,8 +158,8 @@ async def main() -> None:
 
     max_task = asyncio.create_task(run_max(ctx))
     tg_task = asyncio.create_task(run_tg(ctx))
-    rotate_task = asyncio.create_task(run_token_rotation(ctx))
-    tasks = (max_task, tg_task, rotate_task)
+    watchdog_task = asyncio.create_task(run_watchdog(ctx))
+    tasks = (max_task, tg_task, watchdog_task)
 
     loop = asyncio.get_running_loop()
 
