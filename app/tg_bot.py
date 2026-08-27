@@ -446,7 +446,7 @@ def build_dispatcher(ctx: Context) -> Dispatcher:
         if forward is None:
             return
         if ctx.max_client is None or not ctx.max_ready.is_set():
-            log.warning("Channel forward: MAX not ready for chat %s", message.chat.id)
+            log.warning("Channel forward: MAX not ready for chat %s, queuing for replay", message.chat.id)
             return
 
         max_chat_id = forward["max_chat_id"]
@@ -510,9 +510,117 @@ def build_dispatcher(ctx: Context) -> Dispatcher:
                     await ctx.max_send_media(max_chat_id, a, caption=caption)
             elif text:
                 await ctx.max_send(max_chat_id, text)
-            log.info("Channel forward: sent to MAX chat %s", max_chat_id)
+            
+            # Only update last_msg_id on successful send
+            await ctx.db.aset_forward_last_msg_id(message.chat.id, message.message_id)
+            log.info("Channel forward: sent to MAX chat %s (last_msg_id=%s)", max_chat_id, message.message_id)
         except Exception as exc:  # noqa: BLE001
             log.error("Forward channel->MAX failed (channel=%s): %s", message.chat.id, exc)
+
+    async def _replay_channel_forward(ctx: Context, tg_channel_id: int) -> int:
+        """Replay missed channel messages from last_msg_id to current."""
+        forward = await ctx.db.aget_forward(tg_channel_id)
+        if forward is None:
+            return 0
+        if ctx.max_client is None or not ctx.max_ready.is_set():
+            log.warning("Replay: MAX not ready for channel %s", tg_channel_id)
+            return 0
+        
+        max_chat_id = forward["max_chat_id"]
+        last_msg_id = await ctx.db.aget_forward_last_msg_id(tg_channel_id)
+        
+        # Skip replay if no previous forward (first run) to avoid replaying history
+        if last_msg_id == 0:
+            log.info("Replay: first run for channel %s, skipping replay", tg_channel_id)
+            return 0
+        
+        log.info("Replay: fetching channel %s history from msg_id > %s", tg_channel_id, last_msg_id)
+        
+        try:
+            # Get channel history - messages after last_msg_id
+            # Note: get_chat_history returns messages from newest to oldest
+            messages = []
+            async for msg in ctx.bot.get_chat_history(tg_channel_id, limit=100):
+                if msg.message_id <= last_msg_id:
+                    break
+                messages.append(msg)
+            
+            if not messages:
+                log.info("Replay: no new messages for channel %s", tg_channel_id)
+                return 0
+            
+            # Reverse to process oldest first
+            messages.reverse()
+            
+            replayed = 0
+            for msg in messages:
+                try:
+                    text = msg.text or msg.caption or ""
+                    photo_attachments = []
+                    other_attachments = []
+                    
+                    if msg.photo:
+                        from pymax import Photo
+                        raw = (await ctx.bot.download(msg.photo[-1].file_id)).getvalue()
+                        photo_attachments.append(Photo(raw=raw, name="photo.jpg"))
+                    if msg.video:
+                        from pymax import Video
+                        name = msg.video.file_name or "video.mp4"
+                        raw = (await ctx.bot.download(msg.video.file_id)).getvalue()
+                        other_attachments.append(Video(raw=raw, name=name))
+                    if msg.document:
+                        from pymax import File
+                        name = msg.document.file_name or "file.bin"
+                        raw = (await ctx.bot.download(msg.document.file_id)).getvalue()
+                        other_attachments.append(File(raw=raw, name=name))
+                    if msg.audio:
+                        from pymax import File
+                        name = msg.audio.file_name or "audio.mp3"
+                        raw = (await ctx.bot.download(msg.audio.file_id)).getvalue()
+                        other_attachments.append(File(raw=raw, name=name))
+                    if msg.voice:
+                        from pymax import Voice
+                        raw = (await ctx.bot.download(msg.voice.file_id)).getvalue()
+                        other_attachments.append(Voice(raw=raw, name="voice.ogg"))
+                    
+                    if photo_attachments and other_attachments:
+                        await ctx.max_client.send_message(
+                            chat_id=max_chat_id,
+                            text=text,
+                            attachments=photo_attachments,
+                            notify=True
+                        )
+                        for a in other_attachments:
+                            await ctx.max_send_media(max_chat_id, a, caption=None)
+                    elif photo_attachments:
+                        await ctx.max_client.send_message(
+                            chat_id=max_chat_id,
+                            text=text,
+                            attachments=photo_attachments,
+                            notify=True
+                        )
+                    elif other_attachments:
+                        for a in other_attachments:
+                            caption = text if a == other_attachments[0] else None
+                            await ctx.max_send_media(max_chat_id, a, caption=caption)
+                    elif text:
+                        await ctx.max_send(max_chat_id, text)
+                    
+                    # Update last_msg_id after each successful send
+                    await ctx.db.aset_forward_last_msg_id(tg_channel_id, msg.message_id)
+                    replayed += 1
+                    await asyncio.sleep(0.5)  # rate limit
+                except Exception as exc:  # noqa: BLE001
+                    log.error("Replay: failed to forward msg %s from channel %s: %s", 
+                              msg.message_id, tg_channel_id, exc)
+                    break  # stop on first failure
+            
+            log.info("Replay: forwarded %s messages for channel %s", replayed, tg_channel_id)
+            return replayed
+            
+        except Exception as exc:  # noqa: BLE001
+            log.error("Replay: failed for channel %s: %s", tg_channel_id, exc)
+            return 0
 
     @dp.message(Command(commands=["presence"]))
     async def _cmd_presence(message: Message) -> None:

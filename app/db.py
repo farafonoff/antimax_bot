@@ -40,7 +40,14 @@ class LinksDB:
                 )
                 """
             )
-            con.commit()
+            # Migration: add last_msg_id column if not exists
+            try:
+                con.execute(
+                    "ALTER TABLE channel_forwards ADD COLUMN last_msg_id INTEGER DEFAULT 0"
+                )
+                con.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
     @staticmethod
     def coerce_chat_id(raw: str):
@@ -124,6 +131,22 @@ class LinksDB:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    # last message ID for replay
+    def get_forward_last_msg_id(self, tg_channel_id: int) -> int:
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT last_msg_id FROM channel_forwards WHERE tg_channel_id = ?", (tg_channel_id,)
+            ).fetchone()
+        return row["last_msg_id"] if row else 0
+
+    def set_forward_last_msg_id(self, tg_channel_id: int, msg_id: int) -> None:
+        with self._connect() as con:
+            con.execute(
+                "UPDATE channel_forwards SET last_msg_id = ? WHERE tg_channel_id = ?",
+                (msg_id, tg_channel_id),
+            )
+            con.commit()
+
     # async wrappers
     async def aget_link(self, max_chat_id) -> dict | None:
         return await asyncio.to_thread(self.get_link, max_chat_id)
@@ -151,3 +174,9 @@ class LinksDB:
 
     async def alist_forwards(self) -> list[dict]:
         return await asyncio.to_thread(self.list_forwards)
+
+    async def aget_forward_last_msg_id(self, tg_channel_id: int) -> int:
+        return await asyncio.to_thread(self.get_forward_last_msg_id, tg_channel_id)
+
+    async def aset_forward_last_msg_id(self, tg_channel_id: int, msg_id: int) -> None:
+        await asyncio.to_thread(self.set_forward_last_msg_id, tg_channel_id, msg_id)

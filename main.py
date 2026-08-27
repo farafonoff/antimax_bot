@@ -14,7 +14,7 @@ from app.db import LinksDB
 from app.logger import log
 from app.max_client import build_max_client
 from app.sms_provider import SmsInbox
-from app.tg_bot import build_dispatcher
+from app.tg_bot import build_dispatcher, _replay_channel_forward
 from app.tg_logs import start_tg_log_worker
 
 
@@ -84,7 +84,28 @@ async def run_max(ctx: Context) -> None:
         ctx.max_client = build_max_client(ctx)
 
 
-async def run_watchdog(ctx: Context) -> None:
+async def run_replay_on_reconnect(ctx: Context) -> None:
+    """After MAX reconnects, replay missed channel forwards."""
+    was_disconnected = False
+    while True:
+        await asyncio.sleep(30)
+        if ctx.max_client is None:
+            continue
+        if not ctx.max_ready.is_set():
+            was_disconnected = True
+            continue
+        if was_disconnected:
+            log.info("MAX reconnected, starting channel forward replay")
+            # Get all forwards
+            forwards = await ctx.db.alist_forwards()
+            for fwd in forwards:
+                tg_channel_id = fwd["tg_channel_id"]
+                try:
+                    await _replay_channel_forward(ctx, tg_channel_id)
+                except Exception as exc:  # noqa: BLE001
+                    log.error("Replay failed for channel %s: %s", tg_channel_id, exc)
+                await asyncio.sleep(1)
+            was_disconnected = False
     """Watch for stuck MAX connection (transport failing but max_ready=True).
     If presence hasn't updated in STUCK_THRESHOLD seconds while ready,
     force a client restart to trigger proper reconnection."""
@@ -159,7 +180,8 @@ async def main() -> None:
     max_task = asyncio.create_task(run_max(ctx))
     tg_task = asyncio.create_task(run_tg(ctx))
     watchdog_task = asyncio.create_task(run_watchdog(ctx))
-    tasks = (max_task, tg_task, watchdog_task)
+    replay_task = asyncio.create_task(run_replay_on_reconnect(ctx))
+    tasks = (max_task, tg_task, watchdog_task, replay_task)
 
     loop = asyncio.get_running_loop()
 
