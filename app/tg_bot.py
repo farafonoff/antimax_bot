@@ -346,7 +346,31 @@ def build_dispatcher(ctx: Context) -> Dispatcher:
         lines = ["<b>Telegram Channel → MAX Chat форварды:</b>"]
         for f in forwards:
             name = f.get("name") or "—"
-            lines.append(f"<code>{f['tg_channel_id']}</code> → <code>{f['max_chat_id']}</code> ({name})")
+            tg_channel_id = f["tg_channel_id"]
+            last_msg_id = await ctx.db.aget_forward_last_msg_id(tg_channel_id)
+            
+            # Get channel info if bot can access it
+            channel_info = ""
+            try:
+                chat = await ctx.bot.get_chat(tg_channel_id)
+                if chat.username:
+                    channel_info = f" @{chat.username}"
+                else:
+                    channel_info = f" {chat.title}"
+            except Exception:
+                channel_info = " (нет доступа)"
+            
+            # Status: first run (0) or last forwarded message
+            if last_msg_id == 0:
+                status = "🔄 первый запуск (реплей пропущен)"
+            else:
+                status = f"✅ последнее: <code>{last_msg_id}</code>"
+            
+            lines.append(
+                f"<code>{tg_channel_id}</code>{channel_info}\n"
+                f"  → MAX: <code>{f['max_chat_id']}</code> ({name})\n"
+                f"  {status}"
+            )
         await ctx.tg_reply(message, "\n".join(lines))
 
     @dp.message(Command(commands=["debug_forward"]))
