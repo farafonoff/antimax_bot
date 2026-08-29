@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 
@@ -117,3 +118,38 @@ async def test_stops_on_first_failure_and_leaves_it_and_the_rest_queued(monkeypa
 
     assert result == 1
     ctx.db.adel_pending_forward.assert_awaited_once_with(1)  # only the successful one is dequeued
+
+
+async def test_replayed_post_marks_its_receipt_delivered(monkeypatch):
+    # The receipt opened when the post first arrived (while MAX was down) is
+    # flipped to delivered by the replay, rather than a second one appearing.
+    ctx = make_ctx(pending=[make_pending(id=1, tg_message_id=11, text="queued earlier")])
+    mark_sent = AsyncMock()
+    monkeypatch.setattr(replay_mod.receipts, "mark_sent", mark_sent)
+    monkeypatch.setattr(replay_mod.asyncio, "sleep", AsyncMock())
+    # Real forward_prepared_post here, so the whole replay -> send -> receipt
+    # chain is exercised rather than just the mark_sent call site.
+    ctx.db.aset_forward_last_msg_id = AsyncMock()
+    ctx.max_send = AsyncMock(return_value=SimpleNamespace(id=777))
+
+    await replay_mod.replay_channel_forward(ctx, 123)
+
+    mark_sent.assert_awaited_once_with(ctx, 123, 11, "max1", "777")
+
+
+async def test_failed_replay_marks_its_receipt_failed(monkeypatch):
+    ctx = make_ctx(pending=[make_pending(id=1, tg_message_id=11, text="fail")])
+    mark_failed = AsyncMock()
+    monkeypatch.setattr(replay_mod.receipts, "mark_failed", mark_failed)
+    monkeypatch.setattr(replay_mod.asyncio, "sleep", AsyncMock())
+
+    async def fake_forward(*_args, **_kwargs):
+        raise RuntimeError("still down")
+
+    monkeypatch.setattr(replay_mod, "forward_prepared_post", fake_forward)
+
+    await replay_mod.replay_channel_forward(ctx, 123)
+
+    mark_failed.assert_awaited_once_with(ctx, 123, 11, "still down")
+    # The post itself stays queued for the next reconnect.
+    ctx.db.adel_pending_forward.assert_not_awaited()

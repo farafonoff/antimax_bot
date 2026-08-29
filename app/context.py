@@ -23,6 +23,7 @@ PRESENCE_POLL_INTERVAL = 60  # seconds between CONTACT_PRESENCE refreshes
 PRESENCE_EDIT_INTERVAL = 90  # seconds between edits of the live presence message
 STATUS_ONLINE_WINDOW = 300  # seen within this window counts as "online"
 PRESENCE_MSG_KEY = "__presence_feed_msg__"  # links-table key for the live msg id
+FORWARDS_FEED_KEY = "__forwards_feed__"  # links-table key for the receipts topic
 
 
 class Context:
@@ -50,6 +51,9 @@ class Context:
         self.user_names: dict[int, str] = {}  # user_id -> full name (cached)
         self.presence_feed_thread_id: Optional[int] = None
         self.logs_feed_thread_id: Optional[int] = None
+        self.forwards_feed_thread_id: Optional[int] = None
+        # tg_channel_id -> title, so a receipt doesn't need a get_chat per post.
+        self.tg_channel_titles: dict[int, str] = {}
         # Live presence message: ONE editable message refreshed periodically,
         # instead of posting a new message per event/snapshot.
         self._presence_live_msg_id: Optional[int] = None
@@ -531,6 +535,64 @@ class Context:
             )
         )
 
+    # Receipts may live outside the bridge group (FEEDBACK_CHAT_ID), so these
+    # three take an explicit chat_id instead of assuming self.group_id.
+    async def tg_post_to(
+        self,
+        chat_id: int,
+        html: str,
+        thread_id: int | None = None,
+        reply_to: int | None = None,
+    ):
+        return await self._safe(
+            lambda: self.bot.send_message(
+                chat_id=chat_id,
+                text=html,
+                message_thread_id=thread_id,
+                reply_to_message_id=reply_to,
+                allow_sending_without_reply=True,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        )
+
+    async def tg_edit_to(self, chat_id: int, message_id: int, html: str) -> bool:
+        """Edit a message; returns False if Telegram rejected it as unchanged
+        or gone (both are normal for a periodically-refreshed receipt)."""
+        try:
+            await self._safe(
+                lambda: self.bot.edit_message_text(
+                    html,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            )
+            return True
+        except TelegramBadRequest as exc:
+            log.debug("receipt edit rejected (%s): %s", message_id, exc)
+            return False
+
+    async def tg_forward_to(
+        self,
+        chat_id: int,
+        from_chat_id: int,
+        message_id: int,
+        thread_id: int | None = None,
+    ):
+        """Forward a message into `chat_id`, keeping its "from channel"
+        attribution. Read-only with respect to the source: this never posts
+        anything into `from_chat_id`."""
+        return await self._safe(
+            lambda: self.bot.forward_message(
+                chat_id=chat_id,
+                from_chat_id=from_chat_id,
+                message_id=message_id,
+                message_thread_id=thread_id,
+            )
+        )
+
     async def tg_reply(self, message: Any, text: str):
         try:
             return await message.reply(text, parse_mode=ParseMode.HTML, allow_sending_without_reply=True)
@@ -539,17 +601,38 @@ class Context:
             raise
 
     # ---- MAX-side gateway -----------------------------------------------
-    async def max_send(self, max_chat_id, text: str) -> None:
+    # Both senders return the MAX `Message` pymax hands back, so callers can
+    # read its `.id` -- that's what forward receipts report as #maxMsgId and
+    # what reaction updates are matched against (see app/receipts.py).
+    async def max_send(self, max_chat_id, text: str):
         chat_id = self.db.coerce_chat_id(str(max_chat_id))
-        await self.max_client.send_message(chat_id=chat_id, text=text, notify=True)
+        return await self.max_client.send_message(chat_id=chat_id, text=text, notify=True)
 
-    async def max_send_media(
-        self, max_chat_id, attachment, caption: str | None = None
-    ) -> None:
+    async def max_send_media(self, max_chat_id, attachment, caption: str | None = None):
         chat_id = self.db.coerce_chat_id(str(max_chat_id))
-        await self.max_client.send_message(
+        return await self.max_client.send_message(
             chat_id=chat_id, text=caption, attachments=[attachment], notify=True
         )
+
+    async def max_get_reactions(self, max_chat_id, max_message_ids: list[str]):
+        """Batch-read reactions for messages in one MAX chat.
+
+        Returns ``{message_id: ReactionInfo}``, or ``None`` when MAX wasn't
+        actually asked (no client, not ready, non-numeric chat id) or the call
+        failed -- callers must not treat that as "no reactions".
+        """
+        if self.max_client is None or not self.max_ready.is_set():
+            return None
+        chat_id = self.db.coerce_chat_id(str(max_chat_id))
+        if not isinstance(chat_id, int) or not max_message_ids:
+            return None
+        try:
+            return await self.max_client.get_reactions(
+                chat_id=chat_id, message_ids=[str(m) for m in max_message_ids]
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("get_reactions(%s) failed: %s", max_chat_id, exc)
+            return None
 
     # ---- MAX -> Telegram backfill on link/relink ---------------------------
     async def resolve_user_name(self, user_id):
@@ -645,6 +728,25 @@ class Context:
                 await self.db.aadd_link("__logs_feed__", 0, "MAX logs")
             except Exception:  # noqa: BLE001
                 return
+
+    async def get_or_create_forwards_feed_topic(self) -> Optional[int]:
+        """Topic that holds channel-forward receipts, created on first use."""
+        if self.forwards_feed_thread_id is not None:
+            return self.forwards_feed_thread_id
+        row = await self.db.aget_link(FORWARDS_FEED_KEY)
+        if row and row.get("tg_topic_id"):
+            self.forwards_feed_thread_id = int(row["tg_topic_id"])
+            return self.forwards_feed_thread_id
+        try:
+            topic = await self.tg_create_topic("MAX forwards")
+            self.forwards_feed_thread_id = topic.message_thread_id
+            await self.db.aadd_link(
+                FORWARDS_FEED_KEY, self.forwards_feed_thread_id, "MAX forwards"
+            )
+            return self.forwards_feed_thread_id
+        except Exception as exc:  # noqa: BLE001
+            log.error("forwards feed topic create failed: %s", exc)
+            return None
 
     async def get_or_create_logs_feed_topic(self) -> Optional[int]:
         if self.logs_feed_thread_id is not None:

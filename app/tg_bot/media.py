@@ -6,6 +6,7 @@ from aiogram.types import Message
 from pymax import File, Photo, Video, Voice
 
 from app.context import Context
+from app.receipts import max_message_id_of
 
 
 async def download_tg_attachments(bot: Bot, msg: Message):
@@ -84,10 +85,19 @@ async def build_max_attach(ctx: Context, message: Message):
     return None
 
 
-async def send_grouped_to_max(ctx: Context, max_chat_id, text: str, photo_attachments, other_attachments) -> None:
-    """Send text plus mixed media to MAX, grouping photos into a single album."""
+async def send_grouped_to_max(
+    ctx: Context, max_chat_id, text: str, photo_attachments, other_attachments
+) -> str | None:
+    """Send text plus mixed media to MAX, grouping photos into a single album.
+
+    Returns the MAX message id of the *first* message sent -- the one carrying
+    the caption, and therefore the one a forward receipt points at and
+    reactions are tracked against (see app/receipts.py). None when MAX didn't
+    report a usable id.
+    """
+    first_sent = None
     if photo_attachments and other_attachments:
-        await ctx.max_client.send_message(
+        first_sent = await ctx.max_client.send_message(
             chat_id=max_chat_id,
             text=text,
             attachments=photo_attachments,
@@ -96,7 +106,7 @@ async def send_grouped_to_max(ctx: Context, max_chat_id, text: str, photo_attach
         for a in other_attachments:
             await ctx.max_send_media(max_chat_id, a, caption=None)
     elif photo_attachments:
-        await ctx.max_client.send_message(
+        first_sent = await ctx.max_client.send_message(
             chat_id=max_chat_id,
             text=text,
             attachments=photo_attachments,
@@ -105,6 +115,9 @@ async def send_grouped_to_max(ctx: Context, max_chat_id, text: str, photo_attach
     elif other_attachments:
         for a in other_attachments:
             caption = text if a == other_attachments[0] else None
-            await ctx.max_send_media(max_chat_id, a, caption=caption)
+            sent = await ctx.max_send_media(max_chat_id, a, caption=caption)
+            if first_sent is None:
+                first_sent = sent
     elif text:
-        await ctx.max_send(max_chat_id, text)
+        first_sent = await ctx.max_send(max_chat_id, text)
+    return max_message_id_of(first_sent)

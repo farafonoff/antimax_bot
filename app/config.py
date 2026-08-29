@@ -23,6 +23,10 @@ class Settings:
     max_session_name: str
     db_path: str
     tg_log_level: str
+    # Delivery receipts for channel->MAX forwards (see app/receipts.py).
+    forward_receipts: bool = True
+    # Where receipts go. 0 -> a "MAX forwards" topic in the bridge group.
+    feedback_chat_id: int = 0
 
 
 def _require(name: str) -> str:
@@ -31,6 +35,23 @@ def _require(name: str) -> str:
         _logger.error("Missing env var '%s' (see .env.example)", name)
         raise SystemExit(f"Missing required env var: {name}")
     return value
+
+
+def _flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+def _optional_int(name: str) -> int:
+    raw = os.getenv(name, "0").strip()
+    if not raw:
+        return 0
+    try:
+        return int(raw)
+    except ValueError:
+        raise SystemExit(f"{name} must be an integer (or empty).")
 
 
 def load_settings() -> Settings:
@@ -56,6 +77,8 @@ def load_settings() -> Settings:
         max_session_name=os.getenv("MAX_SESSION_NAME", "main.db"),
         db_path=os.getenv("DB_PATH", str(BASE / "data" / "db.sqlite")),
         tg_log_level=os.getenv("TG_LOG_LEVEL", "WARNING").strip() or "WARNING",
+        forward_receipts=_flag("FORWARD_RECEIPTS", True),
+        feedback_chat_id=_optional_int("FEEDBACK_CHAT_ID"),
     )
 
 

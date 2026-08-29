@@ -189,6 +189,80 @@ class TestReplayAllForwards:
         # All three are attempted despite channel 2 failing.
         assert replayed == [1, 2, 3]
 
+    async def test_reactions_are_refreshed_after_the_sweep(self, monkeypatch):
+        # Reaction events don't fire while MAX is down, so the receipts of
+        # already-delivered posts are caught up in the same reconnect pass.
+        ctx = MagicMock()
+        ctx.db.alist_forwards = AsyncMock(return_value=[{"tg_channel_id": 1}])
+        order = []
+        refresh = AsyncMock(side_effect=lambda _ctx: order.append("refresh"))
+
+        async def fake_replay(ctx_, tg_channel_id):
+            order.append(("replay", tg_channel_id))
+
+        monkeypatch.setattr(main_module, "replay_channel_forward", fake_replay)
+        monkeypatch.setattr(main_module.receipts, "refresh_reactions", refresh)
+        monkeypatch.setattr(main_module.asyncio, "sleep", AsyncMock())
+
+        await main_module._replay_all_forwards(ctx)
+
+        refresh.assert_awaited_once_with(ctx)
+        assert order == [("replay", 1), "refresh"]
+
+    async def test_a_failing_reaction_refresh_does_not_break_the_replay(self, monkeypatch):
+        # No refresh_reactions patch here: the real one runs against a
+        # MagicMock ctx, so it fails internally and must stay swallowed
+        # (see receipts._never_fails).
+        ctx = MagicMock()
+        ctx.db.alist_forwards = AsyncMock(return_value=[{"tg_channel_id": 1}])
+        monkeypatch.setattr(main_module, "replay_channel_forward", AsyncMock())
+        monkeypatch.setattr(main_module.asyncio, "sleep", AsyncMock())
+
+        await main_module._replay_all_forwards(ctx)  # must not raise
+
+
+class TestReactionPollTick:
+    """main._reaction_poll_tick: the periodic top-up for reactions that arrived
+    while MAX was disconnected (live events only fire while connected)."""
+
+    async def test_no_client_is_a_no_op(self, monkeypatch):
+        ctx = MagicMock()
+        ctx.max_client = None
+        refresh = AsyncMock()
+        monkeypatch.setattr(main_module.receipts, "refresh_reactions", refresh)
+
+        assert await main_module._reaction_poll_tick(ctx) == 0
+        refresh.assert_not_awaited()
+
+    async def test_max_not_ready_is_a_no_op(self, monkeypatch):
+        ctx = MagicMock()
+        ctx.max_ready.is_set.return_value = False
+        refresh = AsyncMock()
+        monkeypatch.setattr(main_module.receipts, "refresh_reactions", refresh)
+
+        assert await main_module._reaction_poll_tick(ctx) == 0
+        refresh.assert_not_awaited()
+
+    async def test_ready_refreshes_and_reports_how_many_changed(self, monkeypatch):
+        ctx = MagicMock()
+        ctx.max_ready.is_set.return_value = True
+        refresh = AsyncMock(return_value=3)
+        monkeypatch.setattr(main_module.receipts, "refresh_reactions", refresh)
+
+        assert await main_module._reaction_poll_tick(ctx) == 3
+        refresh.assert_awaited_once_with(ctx)
+
+    async def test_a_swallowed_refresh_failure_reports_zero(self, monkeypatch):
+        # refresh_reactions returns None when it was swallowed by
+        # _never_fails; the tick must not propagate that as a crash.
+        ctx = MagicMock()
+        ctx.max_ready.is_set.return_value = True
+        monkeypatch.setattr(
+            main_module.receipts, "refresh_reactions", AsyncMock(return_value=None)
+        )
+
+        assert await main_module._reaction_poll_tick(ctx) == 0
+
 
 class TestWatchdogTick:
     async def test_no_client_is_a_no_op(self):

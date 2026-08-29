@@ -1,6 +1,7 @@
-from pymax import Client, Message, PresenceEvent, ExtraConfig, SyncOverrides
+from pymax import Client, Message, PresenceEvent, ReactionUpdateEvent, ExtraConfig, SyncOverrides
 from pymax.types import PhotoAttachment, VideoAttachment, AudioAttachment, FileAttachment, StickerAttachment
 
+from app import receipts
 from app.logger import log
 from app.context import Context
 
@@ -91,6 +92,13 @@ def build_max_client(ctx: Context) -> Client:
     @client.on_presence()
     async def _on_presence(event: PresenceEvent, c: Client) -> None:
         await ctx.on_presence_update(event.user_id, event.presence)
+
+    @client.on_reaction_update()
+    async def _on_reaction_update(event: ReactionUpdateEvent, c: Client) -> None:
+        # Reactions on messages the bridge forwarded from a TG channel are
+        # mirrored onto that forward's receipt; anything else is ignored (the
+        # lookup in app/receipts.py simply finds no receipt).
+        await receipts.handle_reaction_event(ctx, event)
 
     @client.on_error()
     async def _on_error(exc: Exception, err_ctx) -> None:

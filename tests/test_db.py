@@ -101,3 +101,129 @@ class TestPendingForwards:
         db.del_forward(1)
 
         assert db.list_pending_forwards(1) == []
+
+
+class TestForwardReceipts:
+    """`forward_receipts` rows back the delivery feedback + reaction mirror
+    (app/receipts.py). Keyed by the source post so the live handler and a
+    replay pass converge on one receipt instead of each creating its own."""
+
+    def test_missing_receipt_is_none(self, db):
+        assert db.get_receipt(1, 11) is None
+
+    def test_upsert_creates_row_with_defaults(self, db):
+        row = db.upsert_receipt(1, 11)
+
+        assert row["tg_channel_id"] == 1
+        assert row["tg_message_id"] == 11
+        assert row["status"] == "queued"
+        assert row["max_message_id"] is None
+
+    def test_upsert_is_idempotent_on_the_same_post(self, db):
+        db.upsert_receipt(1, 11, status="queued")
+        db.upsert_receipt(1, 11, status="sent")
+
+        assert len(db.list_receipts(1)) == 1
+        assert db.get_receipt(1, 11)["status"] == "sent"
+
+    def test_patch_leaves_untouched_fields_alone(self, db):
+        # Delivery updates and reaction updates race for the same row, so each
+        # must only write its own columns.
+        db.upsert_receipt(1, 11, status="sent", max_message_id="777")
+
+        db.upsert_receipt(1, 11, reactions="\U0001f44d 2 — всего 2")
+
+        row = db.get_receipt(1, 11)
+        assert row["status"] == "sent"
+        assert row["max_message_id"] == "777"
+        assert row["reactions"].startswith("\U0001f44d 2")
+
+    def test_none_values_do_not_clobber_stored_fields(self, db):
+        db.upsert_receipt(1, 11, max_message_id="777")
+
+        db.upsert_receipt(1, 11, status="sent", max_message_id=None)
+
+        assert db.get_receipt(1, 11)["max_message_id"] == "777"
+
+    def test_unknown_field_is_rejected(self, db):
+        # Typos would otherwise be silently dropped and look like data loss.
+        with pytest.raises(ValueError, match="unknown receipt field"):
+            db.upsert_receipt(1, 11, statuss="sent")
+
+    def test_lookup_by_max_message(self, db):
+        db.upsert_receipt(1, 11, max_chat_id="-99", max_message_id="777")
+
+        row = db.get_receipt_by_max_message("-99", "777")
+
+        assert row is not None
+        assert row["tg_message_id"] == 11
+
+    def test_lookup_by_max_message_coerces_to_str(self, db):
+        # MAX reports ids as int when sending but as str in reaction events.
+        db.upsert_receipt(1, 11, max_chat_id="-99", max_message_id="777")
+
+        assert db.get_receipt_by_max_message(-99, 777) is not None
+
+    def test_lookup_by_max_message_misses_are_none(self, db):
+        db.upsert_receipt(1, 11, max_chat_id="-99", max_message_id="777")
+
+        assert db.get_receipt_by_max_message("-99", "778") is None
+        assert db.get_receipt_by_max_message("-1", "777") is None
+
+    def test_removing_a_forward_also_clears_its_receipts(self, db):
+        db.add_forward(1, "max1")
+        db.upsert_receipt(1, 11, status="sent")
+
+        db.del_forward(1)
+
+        assert db.list_receipts(1) == []
+
+    def test_list_receipts_is_scoped_and_newest_first(self, db):
+        db.upsert_receipt(1, 11)
+        db.upsert_receipt(1, 12)
+        db.upsert_receipt(2, 21)
+
+        assert [r["tg_message_id"] for r in db.list_receipts(1)] == [12, 11]
+        assert len(db.list_receipts()) == 3
+
+    def test_list_receipts_honours_limit(self, db):
+        for msg_id in range(5):
+            db.upsert_receipt(1, msg_id)
+
+        assert len(db.list_receipts(1, limit=2)) == 2
+
+
+class TestReceiptReactionPollSelection:
+    """Only delivered receipts with a known MAX message id are worth polling
+    -- anything else has nothing to ask MAX about."""
+
+    def test_picks_up_a_delivered_receipt(self, db):
+        db.upsert_receipt(1, 11, status="sent", max_chat_id="-99", max_message_id="777")
+
+        rows = db.list_receipts_for_reaction_poll(0)
+
+        assert [r["tg_message_id"] for r in rows] == [11]
+
+    def test_skips_queued_and_failed(self, db):
+        db.upsert_receipt(1, 11, status="queued", max_chat_id="-99", max_message_id="777")
+        db.upsert_receipt(1, 12, status="failed", max_chat_id="-99", max_message_id="778")
+
+        assert db.list_receipts_for_reaction_poll(0) == []
+
+    def test_skips_delivered_without_a_max_message_id(self, db):
+        db.upsert_receipt(1, 11, status="sent", max_chat_id="-99")
+
+        assert db.list_receipts_for_reaction_poll(0) == []
+
+    def test_skips_rows_older_than_the_window(self, db):
+        import time
+
+        db.upsert_receipt(1, 11, status="sent", max_chat_id="-99", max_message_id="777")
+
+        assert db.list_receipts_for_reaction_poll(time.time() + 60) == []
+
+    def test_honours_limit(self, db):
+        for msg_id in range(5):
+            db.upsert_receipt(1, msg_id, status="sent", max_chat_id="-99", max_message_id=str(msg_id))
+
+        assert len(db.list_receipts_for_reaction_poll(0, limit=3)) == 3

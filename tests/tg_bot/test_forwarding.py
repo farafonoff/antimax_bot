@@ -5,10 +5,13 @@ going through aiogram's Dispatcher -- `register()` is a one-line wrapper
 around each (see app/tg_bot/forwarding.py), so this exercises the exact same
 logic without needing to simulate aiogram's update routing.
 """
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from pymax import Photo
 
+from app import receipts
 from app.max_client import MAX_NO_FORWARD_TAG
 from app.tg_bot.forwarding import forward_channel_to_max, forward_to_max
 from tests.tg_bot.fakes import make_message, make_photo_size
@@ -22,7 +25,7 @@ def make_ctx(**overrides):
     ctx.max_client = MagicMock()
     ctx.max_client.send_message = AsyncMock()
     ctx.max_ready.is_set.return_value = True
-    ctx.db.aget_forward = AsyncMock(return_value={"max_chat_id": "max1"})
+    ctx.db.aget_forward = AsyncMock(return_value={"max_chat_id": "max1", "name": "Family"})
     ctx.db.aset_forward_last_msg_id = AsyncMock()
     ctx.db.aadd_pending_forward = AsyncMock()
     ctx.db.aget_link_by_topic = AsyncMock(return_value={"max_chat_id": "max1"})
@@ -34,6 +37,23 @@ def make_ctx(**overrides):
     for key, value in overrides.items():
         setattr(ctx, key, value)
     return ctx
+
+
+@pytest.fixture
+def spy_receipts(monkeypatch):
+    """Replace app.receipts' entry points with AsyncMocks.
+
+    Without this the real ones would run against a MagicMock ctx, blow up on
+    the first un-awaitable call, and be silently swallowed by `_never_fails`
+    -- so the forwarding path's receipt bookkeeping would go untested. Patched
+    on the `receipts` module object, which is what forwarding/replay import.
+    """
+    spies = {}
+    for name in ("open_receipt", "mark_sent", "mark_queued", "mark_failed"):
+        spy = AsyncMock()
+        monkeypatch.setattr(receipts, name, spy)
+        spies[name] = spy
+    return SimpleNamespace(**spies)
 
 
 class TestForwardChannelToMax:
@@ -265,3 +285,119 @@ class TestForwardToMax:
         # tg_reply is called once for the initial progress note and once for
         # the error message.
         assert ctx.tg_reply.await_count == 2
+
+
+class TestChannelForwardReceipts:
+    """Every forwarded channel post gets exactly one receipt, and its status
+    tracks the delivery attempt (see app/receipts.py)."""
+
+    async def test_receipt_is_opened_before_the_send_is_attempted(self, spy_receipts):
+        # Opened up front so a post is visible as queued even if the process
+        # dies mid-send.
+        ctx = make_ctx()
+        chat = MagicMock(id=-100123)
+        chat.title = "Src"
+        msg = make_message(chat=chat, text="news", message_id=42)
+
+        await forward_channel_to_max(ctx, msg)
+
+        spy_receipts.open_receipt.assert_awaited_once_with(
+            ctx, -100123, 42, channel_title="Src", max_chat_id="max1", max_chat_name="Family",
+        )
+
+    async def test_successful_delivery_records_the_max_message_id(self, spy_receipts):
+        ctx = make_ctx()
+        ctx.max_send = AsyncMock(return_value=SimpleNamespace(id=777))
+        msg = make_message(chat=MagicMock(id=-100123), text="news", message_id=42)
+
+        await forward_channel_to_max(ctx, msg)
+
+        spy_receipts.mark_sent.assert_awaited_once_with(ctx, -100123, 42, "max1", "777")
+        spy_receipts.mark_failed.assert_not_awaited()
+
+    async def test_no_forward_configured_creates_no_receipt(self, spy_receipts):
+        ctx = make_ctx()
+        ctx.db.aget_forward = AsyncMock(return_value=None)
+        msg = make_message(chat=MagicMock(id=-100123), text="news", message_id=42)
+
+        await forward_channel_to_max(ctx, msg)
+
+        spy_receipts.open_receipt.assert_not_awaited()
+
+    async def test_max_offline_marks_the_receipt_queued(self, spy_receipts):
+        ctx = make_ctx()
+        ctx.max_ready.is_set.return_value = False
+        msg = make_message(chat=MagicMock(id=-100123), text="news", message_id=42)
+
+        await forward_channel_to_max(ctx, msg)
+
+        spy_receipts.open_receipt.assert_awaited_once()
+        spy_receipts.mark_queued.assert_awaited_once_with(ctx, -100123, 42, "max1")
+        spy_receipts.mark_sent.assert_not_awaited()
+
+    async def test_send_failure_marks_the_receipt_failed(self, spy_receipts):
+        ctx = make_ctx()
+        ctx.max_send = AsyncMock(side_effect=RuntimeError("MAX API down"))
+        msg = make_message(chat=MagicMock(id=-100123), text="news", message_id=42)
+
+        await forward_channel_to_max(ctx, msg)
+
+        spy_receipts.mark_failed.assert_awaited_once_with(ctx, -100123, 42, "MAX API down")
+        spy_receipts.mark_sent.assert_not_awaited()
+
+    async def test_delivery_without_a_reported_id_is_still_marked_sent(self, spy_receipts):
+        ctx = make_ctx()
+        ctx.max_send = AsyncMock(return_value=None)
+        msg = make_message(chat=MagicMock(id=-100123), text="news", message_id=42)
+
+        await forward_channel_to_max(ctx, msg)
+
+        spy_receipts.mark_sent.assert_awaited_once_with(ctx, -100123, 42, "max1", None)
+
+    async def test_real_receipt_helpers_never_raise_into_the_forward(self):
+        # No spy fixture here: the *real* receipt helpers run against a
+        # MagicMock ctx, so every one of their internal calls fails. The
+        # forward must still go through (see receipts._never_fails).
+        ctx = make_ctx()
+        msg = make_message(chat=MagicMock(id=-100123), text="news", message_id=42)
+
+        await forward_channel_to_max(ctx, msg)
+
+        ctx.max_send.assert_awaited_once_with("max1", "news")
+        ctx.db.aset_forward_last_msg_id.assert_awaited_once_with(-100123, 42)
+
+
+class TestBridgeFeedTopicsAreNotForwarded:
+    """The presence / logs / forwards feeds reserve real forum topics via
+    `__name__` rows in `links`, so a topic lookup can return a row that isn't
+    a MAX chat at all."""
+
+    async def test_forwards_feed_topic_is_skipped(self):
+        ctx = make_ctx()
+        ctx.db.aget_link_by_topic = AsyncMock(return_value={"max_chat_id": "__forwards_feed__"})
+        msg = make_message(text="hi", message_thread_id=10,
+                           from_user=MagicMock(id=1, full_name="Alice"))
+
+        await forward_to_max(ctx, msg)
+
+        ctx.max_send.assert_not_awaited()
+        ctx.max_send_media.assert_not_awaited()
+
+    async def test_presence_feed_topic_is_skipped(self):
+        ctx = make_ctx()
+        ctx.db.aget_link_by_topic = AsyncMock(return_value={"max_chat_id": "__presence_feed__"})
+        msg = make_message(text="hi", message_thread_id=10,
+                           from_user=MagicMock(id=1, full_name="Alice"))
+
+        await forward_to_max(ctx, msg)
+
+        ctx.max_send.assert_not_awaited()
+
+    async def test_a_real_linked_topic_still_forwards(self):
+        ctx = make_ctx()
+        msg = make_message(text="hi", message_thread_id=10,
+                           from_user=MagicMock(id=1, full_name="Alice"))
+
+        await forward_to_max(ctx, msg)
+
+        ctx.max_send.assert_awaited_once_with("max1", "Alice:\n\nhi")

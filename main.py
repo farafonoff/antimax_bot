@@ -9,6 +9,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.types import ChatMemberUpdated, Message
 
+from app import receipts
 from app.config import load_settings
 from app.context import Context
 from app.db import LinksDB
@@ -29,6 +30,7 @@ AUTH_FAILURE_COOLDOWN = 180          # pause before asking MAX for a fresh SMS c
 ATTEMPT_LIMIT_COOLDOWN = 300         # longer pause when MAX says "attempt limit reached"
 STUCK_WATCHDOG_INTERVAL = 60         # check for stuck connection every 60s
 STUCK_THRESHOLD = 120                # consider stuck if no presence update for 120s
+REACTION_POLL_INTERVAL = 300         # refresh forward-receipt reactions every 5m
 
 
 async def _run_max_cycle(ctx: Context, backoff: int) -> int:
@@ -107,6 +109,9 @@ async def _replay_all_forwards(ctx: Context) -> None:
         except Exception as exc:  # noqa: BLE001
             log.error("Replay failed for channel %s: %s", tg_channel_id, exc)
         await asyncio.sleep(1)
+    # Reaction events that fired while MAX was down were never delivered, so
+    # catch the receipts up in the same reconnect pass.
+    await receipts.refresh_reactions(ctx)
 
 
 async def _reconnect_replay_tick(ctx: Context, was_disconnected: bool) -> bool:
@@ -128,6 +133,26 @@ async def run_replay_on_reconnect(ctx: Context) -> None:
     while True:
         await asyncio.sleep(30)
         was_disconnected = await _reconnect_replay_tick(ctx, was_disconnected)
+
+
+async def _reaction_poll_tick(ctx: Context) -> int:
+    """One reaction refresh pass over recently-delivered forwards.
+
+    `on_reaction_update` only fires while MAX is connected, so reactions added
+    during an outage (or before this feature existed) would never reach their
+    receipt. Polling is cheap: one batched get_reactions per MAX chat, and a
+    receipt is only edited when its rendered summary actually changed.
+    """
+    if ctx.max_client is None or not ctx.max_ready.is_set():
+        return 0
+    return await receipts.refresh_reactions(ctx) or 0
+
+
+async def run_reaction_poll(ctx: Context) -> None:
+    """Keep forward receipts' reaction summaries fresh."""
+    while True:
+        await asyncio.sleep(REACTION_POLL_INTERVAL)
+        await _reaction_poll_tick(ctx)
 
 
 async def _watchdog_tick(ctx: Context) -> None:
@@ -214,7 +239,8 @@ async def main() -> None:
     tg_task = asyncio.create_task(run_tg(ctx))
     watchdog_task = asyncio.create_task(run_watchdog(ctx))
     replay_task = asyncio.create_task(run_replay_on_reconnect(ctx))
-    tasks = (max_task, tg_task, watchdog_task, replay_task)
+    reaction_task = asyncio.create_task(run_reaction_poll(ctx))
+    tasks = (max_task, tg_task, watchdog_task, replay_task, reaction_task)
 
     loop = asyncio.get_running_loop()
 

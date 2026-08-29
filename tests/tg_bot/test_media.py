@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 from pymax import File, Photo, Video, Voice
@@ -184,6 +185,62 @@ class TestSendGroupedToMax:
         ctx.max_send.assert_not_awaited()
         ctx.max_send_media.assert_not_awaited()
         ctx.max_client.send_message.assert_not_awaited()
+
+
+class TestSendGroupedToMaxReportsTheMaxMessageId:
+    """The returned id is what a forward receipt reports as #maxMsgId and what
+    MAX reaction updates are matched against (app/receipts.py), so every send
+    branch has to surface the *first* message -- the one carrying the caption."""
+
+    async def test_text_only_returns_the_sent_id(self):
+        ctx = make_send_ctx()
+        ctx.max_send = AsyncMock(return_value=SimpleNamespace(id=777))
+
+        assert await send_grouped_to_max(ctx, "chat1", "hello", [], []) == "777"
+
+    async def test_photo_album_returns_the_album_id(self):
+        ctx = make_send_ctx()
+        ctx.max_client.send_message = AsyncMock(return_value=SimpleNamespace(id=778))
+
+        result = await send_grouped_to_max(ctx, "chat1", "cap", [Photo(raw=b"p", name="p.jpg")], [])
+
+        assert result == "778"
+
+    async def test_mixed_media_returns_the_album_id_not_the_trailing_item(self):
+        ctx = make_send_ctx()
+        ctx.max_client.send_message = AsyncMock(return_value=SimpleNamespace(id=779))
+        ctx.max_send_media = AsyncMock(return_value=SimpleNamespace(id=999))
+
+        result = await send_grouped_to_max(
+            ctx, "chat1", "cap", [Photo(raw=b"p", name="p.jpg")], [Video(raw=b"v", name="v.mp4")]
+        )
+
+        assert result == "779"
+
+    async def test_other_media_returns_the_first_items_id(self):
+        ctx = make_send_ctx()
+        ctx.max_send_media = AsyncMock(
+            side_effect=[SimpleNamespace(id=780), SimpleNamespace(id=781)]
+        )
+
+        result = await send_grouped_to_max(
+            ctx, "chat1", "cap", [], [Video(raw=b"1", name="a.mp4"), Video(raw=b"2", name="b.mp4")]
+        )
+
+        assert result == "780"
+
+    async def test_nothing_sent_returns_none(self):
+        ctx = make_send_ctx()
+
+        assert await send_grouped_to_max(ctx, "chat1", "", [], []) is None
+
+    async def test_a_send_result_without_an_id_returns_none(self):
+        # MAX not reporting an id must degrade to "delivered, id unknown"
+        # rather than storing an unmatchable placeholder.
+        ctx = make_send_ctx()
+        ctx.max_send = AsyncMock(return_value=SimpleNamespace())
+
+        assert await send_grouped_to_max(ctx, "chat1", "hello", [], []) is None
 
 
 class TestDescribeTgMedia:

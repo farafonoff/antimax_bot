@@ -2,6 +2,7 @@ from aiogram import Dispatcher
 from aiogram.filters import Command
 from aiogram.types import Message
 
+from app import receipts
 from app.context import Context
 from app.tg_bot.guards import in_group, is_owner, real_topic
 
@@ -89,6 +90,43 @@ def register(dp: Dispatcher, ctx: Context) -> None:
                 f"<code>{tg_channel_id}</code>{channel_info}\n"
                 f"  → MAX: <code>{f['max_chat_id']}</code> ({name})\n"
                 f"  {status}"
+            )
+        await ctx.tg_reply(message, "\n".join(lines))
+
+    @dp.message(Command(commands=["receipts"]))
+    async def _cmd_receipts(message: Message) -> None:
+        """Recent channel-forward receipts: delivery status + MAX reactions."""
+        if not (is_owner(message, ctx) and in_group(message, ctx)):
+            return
+        parts = message.text.split(maxsplit=1)
+        tg_channel_id = None
+        if len(parts) > 1:
+            try:
+                tg_channel_id = int(parts[1].strip())
+            except ValueError:
+                await ctx.tg_reply(message, "tg_channel_id должен быть числом.")
+                return
+        rows = await ctx.db.alist_receipts(tg_channel_id, limit=15)
+        if not rows:
+            await ctx.tg_reply(message, "Пока нет ни одной квитанции о пересылке.")
+            return
+        if not receipts.receipts_enabled(ctx):
+            head = "<b>Квитанции пересылок</b> (⚠️ FORWARD_RECEIPTS=false — новые не создаются):"
+        else:
+            head = "<b>Квитанции пересылок</b> (последние):"
+        lines = [head]
+        for row in rows:
+            marker = {
+                receipts.STATUS_SENT: "☑️",
+                receipts.STATUS_QUEUED: "☐",
+                receipts.STATUS_FAILED: "☒",
+            }.get(row.get("status"), "•")
+            reactions = row.get("reactions") or "—"
+            lines.append(
+                f"{marker} <code>{row['tg_channel_id']}</code>/"
+                f"<code>{row['tg_message_id']}</code> → "
+                f"MAX <code>{row.get('max_message_id') or '—'}</code> · "
+                f"реакции: {reactions}"
             )
         await ctx.tg_reply(message, "\n".join(lines))
 

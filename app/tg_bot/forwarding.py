@@ -1,10 +1,11 @@
 from aiogram import Dispatcher, F
 from aiogram.types import Message
 
+from app import receipts
 from app.context import Context
 from app.logger import log
 from app.max_client import MAX_NO_FORWARD_TAG
-from app.tg_bot.guards import real_topic
+from app.tg_bot.guards import is_pseudo_link, real_topic
 from app.tg_bot.media import (
     build_max_attach,
     describe_tg_media,
@@ -24,11 +25,19 @@ async def forward_prepared_post(
     -- both only need `.photo`/`.video`/`.document`/`.audio`/`.voice`.
     """
     photo_attachments, other_attachments = await download_tg_attachments(ctx.bot, media_source)
-    await send_grouped_to_max(ctx, max_chat_id, text, photo_attachments, other_attachments)
+    max_message_id = await send_grouped_to_max(
+        ctx, max_chat_id, text, photo_attachments, other_attachments
+    )
     # Only advance the watermark on successful send, so a failed send is
     # retried by the next replay pass instead of being skipped forever.
     await ctx.db.aset_forward_last_msg_id(tg_channel_id, tg_message_id)
-    log.info("Channel forward: sent to MAX chat %s (last_msg_id=%s)", max_chat_id, tg_message_id)
+    # Single choke point for both the live and the replay path, so the receipt
+    # is confirmed exactly once however the post got delivered.
+    await receipts.mark_sent(ctx, tg_channel_id, tg_message_id, max_chat_id, max_message_id)
+    log.info(
+        "Channel forward: sent to MAX chat %s (last_msg_id=%s, max_msg_id=%s)",
+        max_chat_id, tg_message_id, max_message_id,
+    )
 
 
 async def forward_channel_to_max(ctx: Context, message: Message) -> None:
@@ -44,6 +53,15 @@ async def forward_channel_to_max(ctx: Context, message: Message) -> None:
     forward = await ctx.db.aget_forward(message.chat.id)
     if forward is None:
         return
+    max_chat_id = forward["max_chat_id"]
+    # Open the receipt before attempting anything, so a post is visible as
+    # "в очереди" even if the send below fails or the process dies mid-flight.
+    await receipts.open_receipt(
+        ctx, message.chat.id, message.message_id,
+        channel_title=getattr(message.chat, "title", None),
+        max_chat_id=max_chat_id, max_chat_name=forward.get("name"),
+    )
+
     if ctx.max_client is None or not ctx.max_ready.is_set():
         log.warning(
             "Channel forward: MAX not ready for chat %s, queuing post %s for replay",
@@ -52,9 +70,9 @@ async def forward_channel_to_max(ctx: Context, message: Message) -> None:
         text = message.text or message.caption or ""
         kind, file_id, file_name = describe_tg_media(message)
         await ctx.db.aadd_pending_forward(message.chat.id, message.message_id, text, kind, file_id, file_name)
+        await receipts.mark_queued(ctx, message.chat.id, message.message_id, max_chat_id)
         return
 
-    max_chat_id = forward["max_chat_id"]
     log.info("Channel forward: TG channel %s -> MAX chat %s", message.chat.id, max_chat_id)
     text = message.text or message.caption or ""
 
@@ -62,6 +80,7 @@ async def forward_channel_to_max(ctx: Context, message: Message) -> None:
         await forward_prepared_post(ctx, max_chat_id, message.chat.id, message.message_id, text, message)
     except Exception as exc:  # noqa: BLE001
         log.error("Forward channel->MAX failed (channel=%s): %s", message.chat.id, exc)
+        await receipts.mark_failed(ctx, message.chat.id, message.message_id, str(exc))
 
 
 async def forward_to_max(ctx: Context, message: Message) -> None:
@@ -82,6 +101,11 @@ async def forward_to_max(ctx: Context, message: Message) -> None:
     link = await ctx.db.aget_link_by_topic(tid)
     if link is None:
         log.warning("TG->MAX: topic %s not linked to any MAX chat", tid)
+        return
+    if is_pseudo_link(link["max_chat_id"]):
+        # One of the bridge's own feed topics (presence / logs / forwards):
+        # a real topic row, but not a MAX chat to forward into.
+        log.info("TG->MAX: topic %s is a bridge feed (%s), skipping", tid, link["max_chat_id"])
         return
     if ctx.max_client is None or not ctx.max_ready.is_set():
         log.warning("TG->MAX: MAX not ready, dropping message")

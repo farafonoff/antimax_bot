@@ -1,5 +1,6 @@
 import asyncio
 
+from app import receipts
 from app.context import Context
 from app.logger import log
 from app.tg_bot.forwarding import forward_prepared_post
@@ -47,6 +48,7 @@ async def replay_channel_forward(ctx: Context, tg_channel_id: int) -> int:
                 "Replay: failed to forward queued post %s from channel %s: %s",
                 post["tg_message_id"], tg_channel_id, exc,
             )
+            await receipts.mark_failed(ctx, tg_channel_id, post["tg_message_id"], str(exc))
             break  # stop on first failure; remaining posts stay queued
 
     log.info("Replay: forwarded %s queued post(s) for channel %s", replayed, tg_channel_id)
