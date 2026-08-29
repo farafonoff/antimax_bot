@@ -328,3 +328,40 @@ class TestWatchdogTick:
         await main_module._watchdog_tick(ctx)  # must not raise
 
         assert ctx._last_presence_update == 0
+
+
+class TestRunReactionPoll:
+    """The loop itself, not just the tick: polling is the only path reactions
+    reach a receipt by (MAX doesn't push opcode 155 for channel posts), so the
+    first pass must not be a full interval away from startup."""
+
+    async def test_first_pass_comes_sooner_than_the_steady_interval(self, monkeypatch):
+        ctx = make_ctx()
+        delays = []
+        ticks = []
+
+        async def fake_sleep(seconds):
+            delays.append(seconds)
+            if len(delays) == 3:
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr(main_module.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(
+            main_module, "_reaction_poll_tick", AsyncMock(side_effect=lambda _c: ticks.append(1))
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await main_module.run_reaction_poll(ctx)
+
+        # Short first pass, then the steady interval for every pass after it.
+        assert delays == [
+            main_module.REACTION_POLL_FIRST_DELAY,
+            main_module.REACTION_POLL_INTERVAL,
+            main_module.REACTION_POLL_INTERVAL,
+        ]
+        assert len(ticks) == 2  # the third sleep is where the spy stopped the loop
+
+    async def test_the_first_delay_is_shorter_than_the_interval(self):
+        # Guards the constants themselves: swapping them would silently undo
+        # the point of the first pass.
+        assert main_module.REACTION_POLL_FIRST_DELAY < main_module.REACTION_POLL_INTERVAL

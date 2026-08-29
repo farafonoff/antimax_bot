@@ -48,7 +48,7 @@ Five supervisor tasks run concurrently under `asyncio.gather`, sharing one `Cont
 - `run_tg` — starts aiogram polling (`build_dispatcher(ctx)`).
 - `run_watchdog` — MAX's `on_disconnect` hook doesn't always fire when the transport wedges silently; this polls whether `ctx._last_presence_update` (wall-clock, set by the presence poll loop) has gone stale while `max_ready` is still set, and force-stops the client to trigger `run_max`'s reconnect path. Single-tick logic lives in `_watchdog_tick`.
 - `run_replay_on_reconnect` — polls `ctx.max_ready` every 30s; on a not-ready→ready transition it replays every configured channel forward via `replay_channel_forward` so posts made while MAX was down aren't lost. Tick logic is `_reconnect_replay_tick`; the actual replay-all-channels sweep is `_replay_all_forwards` (which also ends with a `receipts.refresh_reactions` pass, since reaction events don't arrive while MAX is down).
-- `run_reaction_poll` — every `REACTION_POLL_INTERVAL` (5m), tops up forward receipts' reaction summaries via `receipts.refresh_reactions`, covering reactions added while MAX was disconnected. Tick logic is `_reaction_poll_tick`.
+- `run_reaction_poll` — every `REACTION_POLL_INTERVAL` (2m), after a shorter `REACTION_POLL_FIRST_DELAY` (45s) first pass, tops up forward receipts' reaction summaries via `receipts.refresh_reactions`. Tick logic is `_reaction_poll_tick`. This is the *primary* path for reactions, not an outage backstop: MAX does not push opcode 155 for messages the bridge posted into a channel, so live `on_reaction_update` events never arrive for them (verified against a live account) — hence the tight cadence. Per-tick cost is bounded and independent of history size: one indexed sqlite read (`idx_forward_receipts_poll`) that returns nothing when no post was delivered in the last `REACTION_POLL_WINDOW` (48h), and otherwise at most `REACTION_POLL_LIMIT`/`REACTION_BATCH` (200/50) `get_reactions` calls per MAX chat.
 
 All five `run_*` loops are thin `while True` wrappers around one extracted per-cycle async function — when changing retry/backoff/replay behavior, edit the `_..._cycle`/`_..._tick` helper, not the loop, and add a test for the helper.
 
@@ -99,7 +99,7 @@ Three invariants:
 
 MAX message ids arrive as `int` from `send_message` but as `str` in reaction events, so everything is normalized to `str` (`max_message_id_of`). `send_grouped_to_max` returns the id of the *first* message it sent (the caption-carrying one) — that's what the receipt points at and what reactions are matched against; if you add a send branch there, it must keep returning that id.
 
-Reactions reach a receipt two ways: live via pymax's `on_reaction_update` (only fires while connected), and by polling — `run_reaction_poll` every 5m plus one pass at the end of each reconnect sweep.
+Reactions reach a receipt two ways: live via pymax's `on_reaction_update`, and by polling — `run_reaction_poll` every 2m plus one pass at the end of each reconnect sweep. In practice **only the poll works for channel forwards**: MAX never sent an opcode-155 event for a bridge-posted channel message during live testing (`handle_reaction_event` logs every one it does get at INFO, so check for `MAX reaction event:` before assuming otherwise). Don't remove the poll on the theory that events cover it.
 
 ### SMS login flow (`app/sms_provider.py`)
 

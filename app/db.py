@@ -96,6 +96,16 @@ class LinksDB:
                 "CREATE INDEX IF NOT EXISTS idx_forward_receipts_max_msg "
                 "ON forward_receipts (max_chat_id, max_message_id)"
             )
+            # The reaction poll runs on a timer and only ever wants the newest
+            # delivered receipts inside a time window. This table grows by one
+            # row per forwarded post and is never pruned, so without an index
+            # matching that query's shape every tick would full-scan and sort
+            # the whole history. Column order and DESC mirror
+            # list_receipts_for_reaction_poll exactly.
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_forward_receipts_poll "
+                "ON forward_receipts (status, created_at DESC, tg_message_id DESC)"
+            )
 
     @staticmethod
     def coerce_chat_id(raw: str):

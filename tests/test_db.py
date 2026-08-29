@@ -227,3 +227,23 @@ class TestReceiptReactionPollSelection:
             db.upsert_receipt(1, msg_id, status="sent", max_chat_id="-99", max_message_id=str(msg_id))
 
         assert len(db.list_receipts_for_reaction_poll(0, limit=3)) == 3
+
+    def test_the_poll_query_is_indexed_rather_than_scanning_all_history(self, db):
+        # forward_receipts grows by one row per forwarded post and is never
+        # pruned, while the poll runs on a timer -- so the per-tick cost must
+        # not depend on how much history has accumulated.
+        with db._connect() as con:
+            plan = con.execute(
+                "EXPLAIN QUERY PLAN "
+                "SELECT * FROM forward_receipts "
+                "WHERE status = 'sent' AND max_message_id IS NOT NULL "
+                "AND max_chat_id IS NOT NULL AND created_at >= ? "
+                "ORDER BY created_at DESC, tg_message_id DESC LIMIT ?",
+                (0.0, 200),
+            ).fetchall()
+        detail = " ".join(row["detail"] for row in plan)
+        assert "idx_forward_receipts_poll" in detail, detail
+        assert "SCAN forward_receipts" not in detail, detail
+        # And the ORDER BY is served by the index, so a growing table never
+        # turns into a growing sort.
+        assert "USE TEMP B-TREE" not in detail, detail

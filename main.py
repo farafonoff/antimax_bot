@@ -30,7 +30,12 @@ AUTH_FAILURE_COOLDOWN = 180          # pause before asking MAX for a fresh SMS c
 ATTEMPT_LIMIT_COOLDOWN = 300         # longer pause when MAX says "attempt limit reached"
 STUCK_WATCHDOG_INTERVAL = 60         # check for stuck connection every 60s
 STUCK_THRESHOLD = 120                # consider stuck if no presence update for 120s
-REACTION_POLL_INTERVAL = 300         # refresh forward-receipt reactions every 5m
+# MAX doesn't push opcode 155 for messages the bridge posts into a channel, so
+# polling is the only way reactions ever reach a receipt -- not a backstop for
+# outages. Hence a tight interval, and a short first pass so a restart doesn't
+# leave reactions unmirrored for minutes.
+REACTION_POLL_INTERVAL = 120         # refresh forward-receipt reactions every 2m
+REACTION_POLL_FIRST_DELAY = 45       # ...and once shortly after startup
 
 
 async def _run_max_cycle(ctx: Context, backoff: int) -> int:
@@ -150,8 +155,10 @@ async def _reaction_poll_tick(ctx: Context) -> int:
 
 async def run_reaction_poll(ctx: Context) -> None:
     """Keep forward receipts' reaction summaries fresh."""
+    delay = REACTION_POLL_FIRST_DELAY
     while True:
-        await asyncio.sleep(REACTION_POLL_INTERVAL)
+        await asyncio.sleep(delay)
+        delay = REACTION_POLL_INTERVAL
         await _reaction_poll_tick(ctx)
 
 
