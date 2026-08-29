@@ -357,6 +357,9 @@ async def refresh_reactions(ctx, window_seconds: int = REACTION_POLL_WINDOW) -> 
         time.time() - window_seconds, REACTION_POLL_LIMIT
     )
     if not rows:
+        # Only receipts with status='sent' AND a max_message_id are pollable,
+        # so "nothing to poll" is a real diagnosis, not a non-event.
+        log.info("reaction poll: no delivered receipts in the last %dh", window_seconds // 3600)
         return 0
 
     by_chat: dict[str, list[dict]] = {}
@@ -371,7 +374,15 @@ async def refresh_reactions(ctx, window_seconds: int = REACTION_POLL_WINDOW) -> 
                 max_chat_id, [str(r["max_message_id"]) for r in batch]
             )
             if not info_map:
-                continue  # None = MAX wasn't reached; {} = nothing to mirror
+                # None = MAX wasn't reached; {} = MAX has no reactions to
+                # report. Distinguished here because they mean very different
+                # things when reactions appear not to work at all.
+                log.info(
+                    "reaction poll: MAX chat %s returned %s for %d message(s)",
+                    max_chat_id, "no response" if info_map is None else "no reactions",
+                    len(batch),
+                )
+                continue
             for row in batch:
                 info = info_map.get(str(row["max_message_id"]))
                 if info is None:
@@ -382,18 +393,27 @@ async def refresh_reactions(ctx, window_seconds: int = REACTION_POLL_WINDOW) -> 
                 )
                 if changed:
                     updated += 1
-    if updated:
-        log.info("reaction poll: updated %d receipt(s)", updated)
+    log.info(
+        "reaction poll: %d receipt(s) checked across %d MAX chat(s), %d updated",
+        len(rows), len(by_chat), updated,
+    )
     return updated
 
 
 @_never_fails
 async def handle_reaction_event(ctx, event) -> bool:
     """Entry point for pymax's `on_reaction_update` (opcode 155)."""
+    chat_id = _field(event, "chat_id")
+    message_id = _field(event, "message_id")
+    # Logged unconditionally: whether MAX pushes opcode 155 to this account at
+    # all is the first thing to know when reactions look dead, and it can't be
+    # inferred from anything else in the log.
+    log.info(
+        "MAX reaction event: chat=%s msg=%s total=%s",
+        chat_id, message_id, _field(event, "total_count", 0),
+    )
     return await apply_reactions(
-        ctx,
-        _field(event, "chat_id"),
-        _field(event, "message_id"),
+        ctx, chat_id, message_id,
         _field(event, "counters", []),
         _field(event, "total_count", 0),
     )

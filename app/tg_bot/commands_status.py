@@ -39,6 +39,8 @@ def register(dp: Dispatcher, ctx: Context) -> None:
             "/list_forwards — показать все форварды\n"
             "/tg_channels — список известных TG каналов (где бот админ)\n"
             "/receipts [<code>tg_channel_id</code>] — доставка последних постов + реакции из MAX\n"
+            "/check_reactions [<code>tg_channel_id</code>] — спросить MAX о реакциях прямо сейчас "
+            "(диагностика, не ждать опроса)\n"
             "• Каждый пересланный пост получает квитанцию: ☑️ доставлено / ☐ в очереди / "
             "☒ ошибка, <code>#maxMsgId</code> и живую сводку реакций.\n"
             "• У каждого канала своя тема «MAX forwards: <i>название</i>», создаётся сама. "

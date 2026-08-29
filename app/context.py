@@ -644,7 +644,12 @@ class Context:
                 chat_id=chat_id, message_ids=[str(m) for m in max_message_ids]
             )
         except Exception as exc:  # noqa: BLE001
-            log.debug("get_reactions(%s) failed: %s", max_chat_id, exc)
+            # WARNING, not debug: pymax's own logger gets no stdout handler here
+            # (app/tg_logs.py only attaches the Telegram sink to it at
+            # TG_LOG_LEVEL), so this is the only place a failing reaction read
+            # becomes visible at all.
+            log.warning("get_reactions(chat=%s, n=%d) failed: %s",
+                        max_chat_id, len(max_message_ids), exc)
             return None
 
     # ---- MAX -> Telegram backfill on link/relink ---------------------------

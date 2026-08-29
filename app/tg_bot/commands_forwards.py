@@ -7,6 +7,78 @@ from app.context import Context
 from app.tg_bot.guards import in_group, is_owner, real_topic
 
 
+async def build_reaction_report(ctx: Context, tg_channel_id: int | None = None) -> str:
+    """On-demand answer to "why don't reactions show up?".
+
+    The live path (pymax `on_reaction_update`) and the 5-minute poll are both
+    invisible when they find nothing, and receipt errors are swallowed by
+    `receipts._never_fails`. This asks MAX directly, right now, and reports
+    what came back so the failing step is identifiable without waiting for a
+    poll tick or reading DEBUG logs.
+    """
+    lines = ["<b>Диагностика реакций</b>"]
+    lines.append(f"FORWARD_RECEIPTS: {'вкл' if receipts.receipts_enabled(ctx) else '⚠️ выкл'}")
+    lines.append(f"MAX подключён: {'да' if ctx.max_ready.is_set() else '⚠️ нет'}")
+
+    rows = await ctx.db.alist_receipts(tg_channel_id, limit=5)
+    if not rows:
+        lines.append("\n⚠️ Квитанций нет — сначала переслать пост из канала.")
+        return "\n".join(lines)
+
+    pollable = [
+        r for r in rows
+        if r.get("status") == receipts.STATUS_SENT and r.get("max_message_id")
+    ]
+    lines.append(
+        f"\nКвитанций: {len(rows)}, из них опрашиваемых "
+        f"(доставлено + есть MAX id): <b>{len(pollable)}</b>"
+    )
+    if not pollable:
+        # The poll query filters on exactly these two columns, so this is the
+        # whole explanation when it is empty.
+        lines.append(
+            "⚠️ Опрашивать нечего: у квитанций нет статуса «доставлено» "
+            "и/или MAX message id. Реакции сопоставляются именно по нему."
+        )
+        for row in rows:
+            lines.append(
+                f"• <code>{row['tg_message_id']}</code>: статус "
+                f"<code>{row.get('status')}</code>, MAX id "
+                f"<code>{row.get('max_message_id') or '—'}</code>"
+            )
+        return "\n".join(lines)
+
+    for row in pollable:
+        max_chat_id = row["max_chat_id"]
+        max_message_id = str(row["max_message_id"])
+        info_map = await ctx.max_get_reactions(max_chat_id, [max_message_id])
+        head = (
+            f"\n• пост <code>{row['tg_message_id']}</code> → MAX "
+            f"<code>{max_chat_id}</code>/<code>{max_message_id}</code>"
+        )
+        if info_map is None:
+            lines.append(head + "\n  ⚠️ MAX не ответил (см. логи: get_reactions failed)")
+            continue
+        info = info_map.get(max_message_id)
+        if info is None:
+            # MAX answered, but not about this id -- so the id we stored isn't
+            # the one MAX knows this message by.
+            lines.append(
+                head + f"\n  ⚠️ MAX ответил, но без этого id. Вернул: "
+                f"<code>{', '.join(map(str, info_map)) or 'пусто'}</code>"
+            )
+            continue
+        rendered = receipts.render_reactions(
+            getattr(info, "counters", None) or [], getattr(info, "total_count", 0) or 0
+        )
+        lines.append(head + f"\n  ✅ MAX вернул: {rendered or 'реакций нет'}")
+        lines.append(f"  В квитанции сейчас: {row.get('reactions') or '—'}")
+
+    updated = await receipts.refresh_reactions(ctx)
+    lines.append(f"\nПринудительный опрос: обновлено квитанций — <b>{updated or 0}</b>")
+    return "\n".join(lines)
+
+
 def register(dp: Dispatcher, ctx: Context) -> None:
     """Channel-forward management + debug/preview commands."""
 
@@ -129,6 +201,21 @@ def register(dp: Dispatcher, ctx: Context) -> None:
                 f"реакции: {reactions}"
             )
         await ctx.tg_reply(message, "\n".join(lines))
+
+    @dp.message(Command(commands=["check_reactions"]))
+    async def _cmd_check_reactions(message: Message) -> None:
+        """Ask MAX for reactions right now and report what came back."""
+        if not (is_owner(message, ctx) and in_group(message, ctx)):
+            return
+        parts = message.text.split(maxsplit=1)
+        tg_channel_id = None
+        if len(parts) > 1:
+            try:
+                tg_channel_id = int(parts[1].strip())
+            except ValueError:
+                await ctx.tg_reply(message, "tg_channel_id должен быть числом.")
+                return
+        await ctx.tg_reply(message, await build_reaction_report(ctx, tg_channel_id))
 
     @dp.message(Command(commands=["debug_forward"]))
     async def _cmd_debug_forward(message: Message) -> None:
