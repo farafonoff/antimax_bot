@@ -100,3 +100,87 @@ class TestTgSendMediaGroup:
 
         _, kwargs = ctx.bot.send_media_group.await_args
         assert kwargs["media"][0].caption is None
+
+
+class TestChannelForwardsTopic:
+    """One receipts topic per source channel, keyed `__forwards_feed_<id>__`
+    in `links` so it survives restarts."""
+
+    async def test_creates_a_topic_named_after_the_channel(self):
+        ctx = make_context()
+        ctx.db.aget_link = AsyncMock(return_value=None)
+        ctx.db.aadd_link = AsyncMock()
+        ctx.tg_create_topic = AsyncMock(return_value=SimpleNamespace(message_thread_id=42))
+
+        assert await ctx.get_or_create_channel_forwards_topic(-100123, "My Channel") == 42
+
+        ctx.tg_create_topic.assert_awaited_once_with("MAX forwards: My Channel")
+        ctx.db.aadd_link.assert_awaited_once_with(
+            "__forwards_feed_-100123__", 42, "MAX forwards: My Channel"
+        )
+
+    async def test_untitled_channel_falls_back_to_its_id(self):
+        ctx = make_context()
+        ctx.db.aget_link = AsyncMock(return_value=None)
+        ctx.db.aadd_link = AsyncMock()
+        ctx.tg_create_topic = AsyncMock(return_value=SimpleNamespace(message_thread_id=42))
+
+        await ctx.get_or_create_channel_forwards_topic(-100123, None)
+
+        ctx.tg_create_topic.assert_awaited_once_with("MAX forwards -100123")
+
+    async def test_two_channels_get_two_topics(self):
+        ctx = make_context()
+        ctx.db.aget_link = AsyncMock(return_value=None)
+        ctx.db.aadd_link = AsyncMock()
+        ctx.tg_create_topic = AsyncMock(side_effect=[
+            SimpleNamespace(message_thread_id=42),
+            SimpleNamespace(message_thread_id=43),
+        ])
+
+        first = await ctx.get_or_create_channel_forwards_topic(-100123, "A")
+        second = await ctx.get_or_create_channel_forwards_topic(-100456, "B")
+
+        assert (first, second) == (42, 43)
+
+    async def test_existing_topic_is_reused_from_the_db(self):
+        ctx = make_context()
+        ctx.db.aget_link = AsyncMock(return_value={"tg_topic_id": 99})
+        ctx.tg_create_topic = AsyncMock()
+
+        assert await ctx.get_or_create_channel_forwards_topic(-100123, "A") == 99
+        ctx.tg_create_topic.assert_not_awaited()
+
+    async def test_second_call_is_served_from_cache(self):
+        ctx = make_context()
+        ctx.db.aget_link = AsyncMock(return_value=None)
+        ctx.db.aadd_link = AsyncMock()
+        ctx.tg_create_topic = AsyncMock(return_value=SimpleNamespace(message_thread_id=42))
+
+        await ctx.get_or_create_channel_forwards_topic(-100123, "A")
+        await ctx.get_or_create_channel_forwards_topic(-100123, "A")
+
+        ctx.tg_create_topic.assert_awaited_once()  # not once per post
+        assert ctx.db.aget_link.await_count == 1
+
+    async def test_create_failure_falls_back_to_the_shared_topic(self):
+        # e.g. the group hit Telegram's forum-topic limit: a receipt must not
+        # be lost just because its own topic couldn't be created.
+        ctx = make_context()
+        ctx.db.aget_link = AsyncMock(return_value=None)
+        ctx.db.aadd_link = AsyncMock()
+        ctx.tg_create_topic = AsyncMock(side_effect=[
+            RuntimeError("too many topics"),
+            SimpleNamespace(message_thread_id=5),
+        ])
+
+        assert await ctx.get_or_create_channel_forwards_topic(-100123, "A") == 5
+
+        ctx.db.aadd_link.assert_awaited_once_with("__forwards_feed__", 5, "MAX forwards")
+
+    async def test_total_failure_returns_none(self):
+        ctx = make_context()
+        ctx.db.aget_link = AsyncMock(return_value=None)
+        ctx.tg_create_topic = AsyncMock(side_effect=RuntimeError("nope"))
+
+        assert await ctx.get_or_create_channel_forwards_topic(-100123, "A") is None

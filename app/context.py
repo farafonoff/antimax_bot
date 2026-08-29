@@ -26,6 +26,17 @@ PRESENCE_MSG_KEY = "__presence_feed_msg__"  # links-table key for the live msg i
 FORWARDS_FEED_KEY = "__forwards_feed__"  # links-table key for the receipts topic
 
 
+def forwards_feed_key(tg_channel_id: int) -> str:
+    """links-table key for one source channel's own receipts topic.
+
+    Receipts are split per source channel; FORWARDS_FEED_KEY remains the
+    shared fallback (and is where receipts created before the split live --
+    those keep their persisted feedback_chat_id/receipt_msg_id, so they are
+    edited in place and never re-resolve a target).
+    """
+    return f"__forwards_feed_{int(tg_channel_id)}__"
+
+
 class Context:
     """Shared mutable state wiring the MAX and Telegram sides together."""
 
@@ -52,6 +63,8 @@ class Context:
         self.presence_feed_thread_id: Optional[int] = None
         self.logs_feed_thread_id: Optional[int] = None
         self.forwards_feed_thread_id: Optional[int] = None
+        # tg_channel_id -> its receipts topic (one topic per source channel).
+        self.forward_feed_threads: dict[int, int] = {}
         # tg_channel_id -> title, so a receipt doesn't need a get_chat per post.
         self.tg_channel_titles: dict[int, str] = {}
         # Live presence message: ONE editable message refreshed periodically,
@@ -729,8 +742,37 @@ class Context:
             except Exception:  # noqa: BLE001
                 return
 
+    async def get_or_create_channel_forwards_topic(
+        self, tg_channel_id: int, channel_title: Optional[str] = None
+    ) -> Optional[int]:
+        """One receipts topic per source channel, created on first use.
+
+        Named after the channel so the forum reads as one thread per feed.
+        Falls back to the shared "MAX forwards" topic if creation fails (e.g.
+        the group hit Telegram's forum-topic limit), so a receipt is never
+        lost just because its own topic couldn't be made.
+        """
+        key = int(tg_channel_id)
+        cached = self.forward_feed_threads.get(key)
+        if cached is not None:
+            return cached
+        row = await self.db.aget_link(forwards_feed_key(key))
+        if row and row.get("tg_topic_id"):
+            self.forward_feed_threads[key] = int(row["tg_topic_id"])
+            return self.forward_feed_threads[key]
+        name = f"MAX forwards: {channel_title}" if channel_title else f"MAX forwards {key}"
+        try:
+            topic = await self.tg_create_topic(name)
+        except Exception as exc:  # noqa: BLE001
+            log.error("forwards topic create failed for channel %s: %s", key, exc)
+            return await self.get_or_create_forwards_feed_topic()
+        self.forward_feed_threads[key] = topic.message_thread_id
+        await self.db.aadd_link(forwards_feed_key(key), topic.message_thread_id, name)
+        return self.forward_feed_threads[key]
+
     async def get_or_create_forwards_feed_topic(self) -> Optional[int]:
-        """Topic that holds channel-forward receipts, created on first use."""
+        """Shared receipts topic: the pre-split home of every receipt, now only
+        a fallback for when a per-channel topic can't be created."""
         if self.forwards_feed_thread_id is not None:
             return self.forwards_feed_thread_id
         row = await self.db.aget_link(FORWARDS_FEED_KEY)

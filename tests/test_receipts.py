@@ -41,7 +41,7 @@ def make_ctx(db, *, forward_receipts=True, feedback_chat_id=0, forwards_topic=7)
     ctx.max_ready = MagicMock()
     ctx.max_ready.is_set.return_value = True
     ctx.name_for = MagicMock(return_value="MAX Chat")
-    ctx.get_or_create_forwards_feed_topic = AsyncMock(return_value=forwards_topic)
+    ctx.get_or_create_channel_forwards_topic = AsyncMock(return_value=forwards_topic)
     ctx.bot = MagicMock()
     ctx.bot.get_chat = AsyncMock(return_value=SimpleNamespace(title="Src", username=None))
     ctx.tg_forward_to = AsyncMock(return_value=SimpleNamespace(message_id=900))
@@ -189,22 +189,34 @@ class TestRenderReceipt:
 
 
 class TestFeedbackTarget:
-    async def test_defaults_to_a_topic_in_the_bridge_group(self, db):
+    async def test_defaults_to_the_source_channels_own_topic(self, db):
         ctx = make_ctx(db)
 
-        assert await receipts._feedback_target(ctx) == (-100555, 7)
+        assert await receipts._feedback_target(ctx, -100123, "Src") == (-100555, 7)
+        ctx.get_or_create_channel_forwards_topic.assert_awaited_once_with(-100123, "Src")
+
+    async def test_each_source_channel_resolves_its_own_topic(self, db):
+        ctx = make_ctx(db)
+        ctx.get_or_create_channel_forwards_topic = AsyncMock(side_effect=[7, 8])
+
+        first = await receipts._feedback_target(ctx, -100123, "A")
+        second = await receipts._feedback_target(ctx, -100456, "B")
+
+        assert (first, second) == ((-100555, 7), (-100555, 8))
 
     async def test_configured_chat_wins_and_uses_no_topic(self, db):
+        # FEEDBACK_CHAT_ID may be any chat, and only a forum has topics to
+        # split by -- so a configured destination stays one stream.
         ctx = make_ctx(db, feedback_chat_id=-100777)
 
-        assert await receipts._feedback_target(ctx) == (-100777, None)
-        ctx.get_or_create_forwards_feed_topic.assert_not_awaited()
+        assert await receipts._feedback_target(ctx, -100123, "Src") == (-100777, None)
+        ctx.get_or_create_channel_forwards_topic.assert_not_awaited()
 
     async def test_unavailable_topic_yields_no_target(self, db):
         ctx = make_ctx(db)
-        ctx.get_or_create_forwards_feed_topic = AsyncMock(return_value=None)
+        ctx.get_or_create_channel_forwards_topic = AsyncMock(return_value=None)
 
-        assert await receipts._feedback_target(ctx) is None
+        assert await receipts._feedback_target(ctx, -100123, "Src") is None
 
 
 class TestOpenReceipt:
@@ -237,6 +249,22 @@ class TestOpenReceipt:
         assert ctx.tg_post_to.await_args.args[0] == -100555
         # forward_to reads from the channel; it never posts into it.
         assert ctx.tg_forward_to.await_args.args[0] == -100555
+
+    async def test_receipts_from_two_channels_land_in_two_topics(self, db):
+        ctx = make_ctx(db)
+        ctx.get_or_create_channel_forwards_topic = AsyncMock(side_effect=[7, 8])
+
+        await receipts.open_receipt(ctx, -100123, 42, channel_title="A")
+        await receipts.open_receipt(ctx, -100456, 43, channel_title="B")
+
+        assert [c.kwargs["thread_id"] for c in ctx.tg_post_to.await_args_list] == [7, 8]
+
+    async def test_the_topic_is_resolved_from_the_channel_being_reported(self, db):
+        ctx = make_ctx(db)
+
+        await receipts.open_receipt(ctx, -100123, 42, channel_title="Src")
+
+        ctx.get_or_create_channel_forwards_topic.assert_awaited_once_with(-100123, "Src")
 
     async def test_disabled_by_flag_touches_nothing(self, db):
         ctx = make_ctx(db, forward_receipts=False)

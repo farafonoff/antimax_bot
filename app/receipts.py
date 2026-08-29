@@ -157,16 +157,20 @@ def _fmt_time(unix_ts) -> Optional[str]:
     return datetime.fromtimestamp(stamp).strftime("%d.%m %H:%M")
 
 
-async def _feedback_target(ctx) -> Optional[tuple[int, Optional[int]]]:
-    """Resolve (chat_id, thread_id) for receipts.
+async def _feedback_target(
+    ctx, tg_channel_id: int, channel_title: str | None = None
+) -> Optional[tuple[int, Optional[int]]]:
+    """Resolve (chat_id, thread_id) for a receipt from `tg_channel_id`.
 
-    A configured FEEDBACK_CHAT_ID is used as-is (no topic); otherwise receipts
-    go to the auto-created "MAX forwards" topic in the bridge group.
+    A configured FEEDBACK_CHAT_ID is used as-is: it may be any chat, and only a
+    forum supergroup has topics to split by, so everything lands in one stream
+    there. Otherwise each source channel gets its own auto-created topic in the
+    bridge group.
     """
     configured = int(getattr(ctx.settings, "feedback_chat_id", 0) or 0)
     if configured:
         return configured, None
-    thread_id = await ctx.get_or_create_forwards_feed_topic()
+    thread_id = await ctx.get_or_create_channel_forwards_topic(tg_channel_id, channel_title)
     if thread_id is None:
         return None
     return ctx.group_id, thread_id
@@ -201,7 +205,9 @@ async def _render_and_sync(ctx, row: dict) -> None:
         await ctx.tg_edit_to(int(chat_id), int(receipt_msg_id), text)
         return
 
-    target = await _feedback_target(ctx)
+    target = await _feedback_target(
+        ctx, int(row["tg_channel_id"]), row.get("channel_title")
+    )
     if target is None:
         return
     chat_id, thread_id = target
