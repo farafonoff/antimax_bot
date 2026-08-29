@@ -40,6 +40,42 @@ async def download_tg_attachments(bot: Bot, msg: Message):
     return photo_attachments, other_attachments
 
 
+async def download_tg_album(bot: Bot, messages) -> list:
+    """Flat, order-preserving attachment list for a Telegram media group.
+
+    Telegram delivers an album as one message per item and **may mix photos
+    and videos in the same group**, while MAX's `send_message` takes a single
+    mixed `attachments` sequence. Since a TG message carries at most one media
+    field, iterating the group in order and appending whatever each item holds
+    reproduces the album exactly -- which is why an album does *not* go
+    through `send_grouped_to_max`'s photos-album-plus-the-rest-separately
+    split: that would tear a mixed album into several MAX messages.
+    """
+    attachments = []
+    for msg in messages:
+        photo_attachments, other_attachments = await download_tg_attachments(bot, msg)
+        attachments.extend(photo_attachments)
+        attachments.extend(other_attachments)
+    return attachments
+
+
+async def send_album_to_max(ctx: Context, max_chat_id, text: str, attachments) -> str | None:
+    """Send one MAX message carrying a whole Telegram album.
+
+    Returns its MAX message id -- the album is a single message, so this is
+    also what its forward receipt points at and reactions are matched against.
+    """
+    if not attachments:
+        return max_message_id_of(await ctx.max_send(max_chat_id, text)) if text else None
+    sent = await ctx.max_client.send_message(
+        chat_id=max_chat_id,
+        text=text,
+        attachments=attachments,
+        notify=True,
+    )
+    return max_message_id_of(sent)
+
+
 def describe_tg_media(msg: Message) -> tuple[str | None, str | None, str | None]:
     """Identify (kind, file_id, file_name) for a message's attachment without
     downloading it -- used to persist a channel post queued while MAX is

@@ -1,3 +1,4 @@
+import sqlite3
 import tempfile
 from pathlib import Path
 
@@ -10,6 +11,37 @@ from app.db import LinksDB
 def db():
     with tempfile.TemporaryDirectory() as tmp:
         yield LinksDB(str(Path(tmp) / "test.sqlite"))
+
+
+class TestSchemaMigrations:
+    """Deployments upgrade in place over a mounted ./data volume, so the schema
+    has to grow on an existing file rather than only on a fresh one."""
+
+    def test_media_group_id_is_added_to_a_pre_existing_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "old.sqlite")
+            with sqlite3.connect(path) as con:
+                con.execute(
+                    "CREATE TABLE pending_forwards ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, tg_channel_id INTEGER NOT NULL, "
+                    "tg_message_id INTEGER NOT NULL, text TEXT, media_kind TEXT, "
+                    "media_file_id TEXT, media_file_name TEXT, created_at REAL)"
+                )
+                con.execute(
+                    "INSERT INTO pending_forwards (tg_channel_id, tg_message_id, text) "
+                    "VALUES (1, 11, 'queued before the upgrade')"
+                )
+                con.commit()
+
+            db = LinksDB(path)
+
+            # The old row survives, with no group -- so it replays as its own
+            # single post, exactly as it would have before.
+            [row] = db.list_pending_forwards(1)
+            assert row["text"] == "queued before the upgrade"
+            assert row["media_group_id"] is None
+            # And re-opening doesn't try to add the column twice.
+            assert LinksDB(path).list_pending_forwards(1)[0]["media_group_id"] is None
 
 
 class TestForwardLastMsgIdIsMonotonic:
@@ -66,6 +98,21 @@ class TestPendingForwards:
 
         assert pending[0]["media_kind"] == "photo"
         assert pending[0]["media_file_id"] == "file123"
+
+    def test_album_items_keep_their_group_id(self, db):
+        # What replay_channel_forward regroups by, so a media group queued
+        # during an outage comes back as one MAX album.
+        db.add_pending_forward(1, 11, "caption", "photo", "p1", None, "grp42")
+        db.add_pending_forward(1, 12, "", "photo", "p2", None, "grp42")
+
+        pending = db.list_pending_forwards(1)
+
+        assert [p["media_group_id"] for p in pending] == ["grp42", "grp42"]
+
+    def test_a_plain_post_has_no_group_id(self, db):
+        db.add_pending_forward(1, 11, "hello")
+
+        assert db.list_pending_forwards(1)[0]["media_group_id"] is None
 
     def test_listed_oldest_message_first(self, db):
         db.add_pending_forward(1, 13, "c")

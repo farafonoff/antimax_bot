@@ -5,6 +5,7 @@ going through aiogram's Dispatcher -- `register()` is a one-line wrapper
 around each (see app/tg_bot/forwarding.py), so this exercises the exact same
 logic without needing to simulate aiogram's update routing.
 """
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -13,8 +14,9 @@ from pymax import Photo
 
 from app import receipts
 from app.max_client import MAX_NO_FORWARD_TAG
+from app.tg_bot import forwarding as forwarding_mod
 from app.tg_bot.forwarding import forward_channel_to_max, forward_to_max
-from tests.tg_bot.fakes import make_message, make_photo_size
+from tests.tg_bot.fakes import make_media, make_message, make_photo_size
 
 
 
@@ -37,6 +39,15 @@ def make_ctx(**overrides):
     for key, value in overrides.items():
         setattr(ctx, key, value)
     return ctx
+
+
+@pytest.fixture(autouse=True)
+def clean_album_buffers():
+    """The album buffer is module-level state; a test must not inherit
+    another's half-collected group."""
+    forwarding_mod._ALBUM_BUFFERS.clear()
+    yield
+    forwarding_mod._ALBUM_BUFFERS.clear()
 
 
 @pytest.fixture
@@ -86,7 +97,9 @@ class TestForwardChannelToMax:
 
         ctx.max_send.assert_not_awaited()
         ctx.db.aset_forward_last_msg_id.assert_not_awaited()
-        ctx.db.aadd_pending_forward.assert_awaited_once_with(-100123, 5, "hello", None, None, None)
+        ctx.db.aadd_pending_forward.assert_awaited_once_with(
+            -100123, 5, "hello", None, None, None, None
+        )
 
     async def test_max_not_ready_queues_media_post_with_its_file_id(self):
         ctx = make_ctx()
@@ -98,7 +111,9 @@ class TestForwardChannelToMax:
 
         await forward_channel_to_max(ctx, msg)
 
-        ctx.db.aadd_pending_forward.assert_awaited_once_with(-100123, 6, "look", "video", "v1", "clip.mp4")
+        ctx.db.aadd_pending_forward.assert_awaited_once_with(
+            -100123, 6, "look", "video", "v1", "clip.mp4", None
+        )
 
     async def test_no_forward_configured_does_not_queue_either(self):
         ctx = make_ctx()
@@ -401,3 +416,193 @@ class TestBridgeFeedTopicsAreNotForwarded:
         await forward_to_max(ctx, msg)
 
         ctx.max_send.assert_awaited_once_with("max1", "Alice:\n\nhi")
+
+
+class TestForwardChannelAlbum:
+    """Telegram delivers an album as one channel_post per item with no
+    end-of-group signal, and **may mix photos and videos in one group**. All of
+    it has to land as a single MAX message, or the album arrives torn apart.
+    """
+
+    @staticmethod
+    def album_items(chat, group="g1", count=2, caption_on=0, videos=()):
+        """`count` items of one media group; `videos` holds the indexes that are
+        videos rather than photos (Telegram allows both in one group)."""
+        items = []
+        for i in range(count):
+            kwargs = dict(
+                chat=chat, message_id=100 + i, media_group_id=group,
+                caption="подпись" if i == caption_on else None,
+            )
+            if i in videos:
+                kwargs["video"] = make_media(file_id=f"v{i}", file_name=f"clip{i}.mp4")
+            else:
+                kwargs["photo"] = [make_photo_size(f"p{i}")]
+            items.append(make_message(**kwargs))
+        return items
+
+    async def feed(self, ctx, items, monkeypatch):
+        """Push items through the handler and let the debounce flush fire.
+
+        The flusher is a bare `create_task`, so it's captured here and awaited
+        explicitly instead of racing the event loop.
+        """
+        tasks = []
+        real_create_task = asyncio.create_task
+
+        def spy_create_task(coro):
+            task = real_create_task(coro)
+            tasks.append(task)
+            return task
+
+        monkeypatch.setattr(forwarding_mod.asyncio, "create_task", spy_create_task)
+        monkeypatch.setattr(forwarding_mod.asyncio, "sleep", AsyncMock())
+        for item in items:
+            await forward_channel_to_max(ctx, item)
+        await asyncio.gather(*tasks)
+        return tasks
+
+    async def test_photo_album_becomes_one_max_message(self, monkeypatch):
+        ctx = make_ctx()
+        ctx.bot.download = AsyncMock(return_value=MagicMock(getvalue=lambda: b"img"))
+        chat = MagicMock(id=-100123)
+
+        await self.feed(ctx, self.album_items(chat, count=3), monkeypatch)
+
+        ctx.max_client.send_message.assert_awaited_once()
+        attachments = ctx.max_client.send_message.await_args.kwargs["attachments"]
+        assert len(attachments) == 3
+        assert all(isinstance(a, Photo) for a in attachments)
+
+    async def test_a_mixed_photo_and_video_album_stays_one_message_in_order(self, monkeypatch):
+        # The regression this guards: send_grouped_to_max would have sent the
+        # photos as an album and each video as its own extra message.
+        ctx = make_ctx()
+        ctx.bot.download = AsyncMock(return_value=MagicMock(getvalue=lambda: b"blob"))
+        chat = MagicMock(id=-100123)
+
+        await self.feed(ctx, self.album_items(chat, count=4, videos=(1, 3)), monkeypatch)
+
+        ctx.max_client.send_message.assert_awaited_once()
+        attachments = ctx.max_client.send_message.await_args.kwargs["attachments"]
+        assert [type(a).__name__ for a in attachments] == ["Photo", "Video", "Photo", "Video"]
+        # Nothing was sent separately alongside the album.
+        ctx.max_send_media.assert_not_awaited()
+        ctx.max_send.assert_not_awaited()
+
+    async def test_the_caption_is_used_wherever_telegram_put_it(self, monkeypatch):
+        ctx = make_ctx()
+        ctx.bot.download = AsyncMock(return_value=MagicMock(getvalue=lambda: b"img"))
+        chat = MagicMock(id=-100123)
+
+        await self.feed(ctx, self.album_items(chat, count=3, caption_on=2), monkeypatch)
+
+        assert ctx.max_client.send_message.await_args.kwargs["text"] == "подпись"
+
+    async def test_the_watermark_advances_to_the_last_item(self, monkeypatch):
+        # Not the anchor: every item up to the last one has been handled, and
+        # leaving the watermark behind would re-forward the tail.
+        ctx = make_ctx()
+        ctx.bot.download = AsyncMock(return_value=MagicMock(getvalue=lambda: b"img"))
+        chat = MagicMock(id=-100123)
+
+        await self.feed(ctx, self.album_items(chat, count=3), monkeypatch)
+
+        ctx.db.aset_forward_last_msg_id.assert_awaited_once_with(-100123, 102)
+
+    async def test_one_receipt_per_album_not_one_per_photo(self, monkeypatch, spy_receipts):
+        ctx = make_ctx()
+        ctx.bot.download = AsyncMock(return_value=MagicMock(getvalue=lambda: b"img"))
+        chat = MagicMock(id=-100123)
+
+        await self.feed(ctx, self.album_items(chat, count=3), monkeypatch)
+
+        spy_receipts.open_receipt.assert_awaited_once()
+        assert spy_receipts.open_receipt.await_args.args[2] == 100  # the anchor
+        spy_receipts.mark_sent.assert_awaited_once()
+        assert spy_receipts.mark_sent.await_args.args[2] == 100
+
+    async def test_items_arriving_out_of_order_are_sorted(self, monkeypatch):
+        ctx = make_ctx()
+        downloaded = []
+        ctx.bot.download = AsyncMock(
+            side_effect=lambda fid: downloaded.append(fid)
+            or MagicMock(getvalue=lambda: b"img")
+        )
+        chat = MagicMock(id=-100123)
+        items = self.album_items(chat, count=3)
+
+        await self.feed(ctx, [items[2], items[0], items[1]], monkeypatch)
+
+        assert downloaded == ["p0", "p1", "p2"]
+
+    async def test_two_albums_in_the_same_channel_do_not_merge(self, monkeypatch):
+        ctx = make_ctx()
+        ctx.bot.download = AsyncMock(return_value=MagicMock(getvalue=lambda: b"img"))
+        chat = MagicMock(id=-100123)
+        first = self.album_items(chat, group="g1", count=2)
+        second = [
+            make_message(chat=chat, message_id=200 + i, media_group_id="g2",
+                         photo=[make_photo_size(f"q{i}")])
+            for i in range(2)
+        ]
+
+        await self.feed(ctx, first + second, monkeypatch)
+
+        assert ctx.max_client.send_message.await_count == 2
+        assert [
+            len(call.kwargs["attachments"])
+            for call in ctx.max_client.send_message.await_args_list
+        ] == [2, 2]
+
+    async def test_a_plain_post_is_untouched_by_the_album_path(self, monkeypatch):
+        # Regression guard: single posts must keep going through
+        # send_grouped_to_max, with no buffering and no debounce.
+        ctx = make_ctx()
+        msg = make_message(chat=MagicMock(id=-100123), text="просто текст", message_id=42)
+
+        await forward_channel_to_max(ctx, msg)
+
+        ctx.max_send.assert_awaited_once_with("max1", "просто текст")
+        ctx.db.aset_forward_last_msg_id.assert_awaited_once_with(-100123, 42)
+        assert not forwarding_mod._ALBUM_BUFFERS
+
+    async def test_the_buffer_is_emptied_after_a_flush(self, monkeypatch):
+        ctx = make_ctx()
+        ctx.bot.download = AsyncMock(return_value=MagicMock(getvalue=lambda: b"img"))
+        chat = MagicMock(id=-100123)
+
+        await self.feed(ctx, self.album_items(chat, count=2), monkeypatch)
+
+        assert not forwarding_mod._ALBUM_BUFFERS
+
+    async def test_a_failing_flush_still_clears_the_buffer(self, monkeypatch):
+        # Nothing awaits the flush task, so a leak here would wedge the channel:
+        # the stale key makes every later item of a *new* album with the same
+        # group id pile up behind a flusher that already finished.
+        ctx = make_ctx()
+        ctx.db.aget_forward = AsyncMock(side_effect=RuntimeError("db gone"))
+        chat = MagicMock(id=-100123)
+
+        await self.feed(ctx, self.album_items(chat, count=2), monkeypatch)
+
+        assert not forwarding_mod._ALBUM_BUFFERS
+
+    async def test_max_down_queues_every_item_tagged_with_its_group(
+        self, monkeypatch, spy_receipts
+    ):
+        ctx = make_ctx()
+        ctx.max_ready.is_set.return_value = False
+        chat = MagicMock(id=-100123)
+
+        await self.feed(ctx, self.album_items(chat, count=3), monkeypatch)
+
+        # One row per item -- each needs its own file_id to re-download --
+        # every one carrying the group id replay regroups by.
+        assert ctx.db.aadd_pending_forward.await_count == 3
+        assert [c.args[1] for c in ctx.db.aadd_pending_forward.await_args_list] == [100, 101, 102]
+        assert {c.args[6] for c in ctx.db.aadd_pending_forward.await_args_list} == {"g1"}
+        # ...but only one receipt, keyed on the anchor.
+        spy_receipts.mark_queued.assert_awaited_once()
+        assert spy_receipts.mark_queued.await_args.args[2] == 100
+        ctx.db.aset_forward_last_msg_id.assert_not_awaited()

@@ -65,6 +65,14 @@ class LinksDB:
                 )
                 """
             )
+            # Migration: an album is queued as one row per item, and
+            # replay_channel_forward regroups them by this so a media group
+            # is replayed as a single MAX album, not as N separate messages.
+            try:
+                con.execute("ALTER TABLE pending_forwards ADD COLUMN media_group_id TEXT")
+                con.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists
             # One row per channel post we tried to forward, holding the
             # editable feedback message that reports its delivery status and
             # (once MAX reports them) its reactions. Keyed by the source post
@@ -228,13 +236,16 @@ class LinksDB:
         media_kind: str | None = None,
         media_file_id: str | None = None,
         media_file_name: str | None = None,
+        media_group_id: str | None = None,
     ) -> None:
         with self._connect() as con:
             con.execute(
                 "INSERT INTO pending_forwards "
-                "(tg_channel_id, tg_message_id, text, media_kind, media_file_id, media_file_name) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (tg_channel_id, tg_message_id, text, media_kind, media_file_id, media_file_name),
+                "(tg_channel_id, tg_message_id, text, media_kind, media_file_id, "
+                "media_file_name, media_group_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (tg_channel_id, tg_message_id, text, media_kind, media_file_id,
+                 media_file_name, media_group_id),
             )
             con.commit()
 
@@ -377,10 +388,12 @@ class LinksDB:
         media_kind: str | None = None,
         media_file_id: str | None = None,
         media_file_name: str | None = None,
+        media_group_id: str | None = None,
     ) -> None:
         await asyncio.to_thread(
             self.add_pending_forward,
-            tg_channel_id, tg_message_id, text, media_kind, media_file_id, media_file_name,
+            tg_channel_id, tg_message_id, text, media_kind, media_file_id,
+            media_file_name, media_group_id,
         )
 
     async def alist_pending_forwards(self, tg_channel_id: int) -> list[dict]:

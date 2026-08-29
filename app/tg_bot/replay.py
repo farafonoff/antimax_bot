@@ -7,6 +7,24 @@ from app.tg_bot.forwarding import forward_prepared_post
 from app.tg_bot.media import rehydrate_tg_media
 
 
+def group_pending_albums(pending: list[dict]) -> list[list[dict]]:
+    """Collapse consecutive queued rows that belong to the same media group.
+
+    `list_pending_forwards` returns rows ordered by tg_message_id, and Telegram
+    numbers an album's items consecutively, so a group's rows are always
+    adjacent. Rows with no `media_group_id` (a plain post, or anything queued
+    before that column existed) each stay their own single-item group.
+    """
+    groups: list[list[dict]] = []
+    for post in pending:
+        group_id = post.get("media_group_id")
+        if group_id and groups and groups[-1][0].get("media_group_id") == group_id:
+            groups[-1].append(post)
+        else:
+            groups.append([post])
+    return groups
+
+
 async def replay_channel_forward(ctx: Context, tg_channel_id: int) -> int:
     """Replay channel posts that were queued (in `pending_forwards`) while
     MAX was disconnected.
@@ -29,26 +47,39 @@ async def replay_channel_forward(ctx: Context, tg_channel_id: int) -> int:
     if not pending:
         return 0
 
-    log.info("Replay: %d queued post(s) for channel %s", len(pending), tg_channel_id)
+    groups = group_pending_albums(pending)
+    log.info(
+        "Replay: %d queued post(s) in %d group(s) for channel %s",
+        len(pending), len(groups), tg_channel_id,
+    )
 
     replayed = 0
-    for post in pending:
+    for group in groups:
+        # The anchor is what the receipt was keyed on when the album was queued.
+        anchor = group[0]
         try:
-            media_source = rehydrate_tg_media(
-                post["media_kind"], post["media_file_id"], post["media_file_name"],
-            )
+            media_sources = [
+                rehydrate_tg_media(p["media_kind"], p["media_file_id"], p["media_file_name"])
+                for p in group
+            ]
+            text = next((p["text"] for p in group if p["text"]), "")
             await forward_prepared_post(
-                ctx, max_chat_id, tg_channel_id, post["tg_message_id"], post["text"] or "", media_source,
+                ctx, max_chat_id, tg_channel_id, anchor["tg_message_id"], text,
+                media_sources if len(media_sources) > 1 else media_sources[0],
+                watermark_msg_id=group[-1]["tg_message_id"],
             )
-            await ctx.db.adel_pending_forward(post["id"])
-            replayed += 1
+            # Only after the whole group landed, so a partial failure leaves
+            # every item of the album queued rather than half of it.
+            for post in group:
+                await ctx.db.adel_pending_forward(post["id"])
+            replayed += len(group)
             await asyncio.sleep(0.5)  # rate limit
         except Exception as exc:  # noqa: BLE001
             log.error(
-                "Replay: failed to forward queued post %s from channel %s: %s",
-                post["tg_message_id"], tg_channel_id, exc,
+                "Replay: failed to forward queued post %s (%d item(s)) from channel %s: %s",
+                anchor["tg_message_id"], len(group), tg_channel_id, exc,
             )
-            await receipts.mark_failed(ctx, tg_channel_id, post["tg_message_id"], str(exc))
+            await receipts.mark_failed(ctx, tg_channel_id, anchor["tg_message_id"], str(exc))
             break  # stop on first failure; remaining posts stay queued
 
     log.info("Replay: forwarded %s queued post(s) for channel %s", replayed, tg_channel_id)
