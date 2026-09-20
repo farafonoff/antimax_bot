@@ -1,12 +1,21 @@
 from types import SimpleNamespace
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message
-
 from pymax import File, Photo, Video, Voice
 
 from app.context import Context
+from app.logger import log
 from app.receipts import max_message_id_of
+
+
+async def _download_file(bot: Bot, file_id: str, label: str) -> bytes | None:
+    try:
+        return (await bot.download(file_id)).getvalue()
+    except TelegramBadRequest as exc:
+        log.warning("Skipping %s: %s", label, exc)
+        return None
 
 
 async def download_tg_attachments(bot: Bot, msg: Message):
@@ -19,23 +28,28 @@ async def download_tg_attachments(bot: Bot, msg: Message):
     other_attachments = []
 
     if msg.photo:
-        raw = (await bot.download(msg.photo[-1].file_id)).getvalue()
-        photo_attachments.append(Photo(raw=raw, name="photo.jpg"))
+        raw = await _download_file(bot, msg.photo[-1].file_id, f"photo {msg.photo[-1].file_id}")
+        if raw is not None:
+            photo_attachments.append(Photo(raw=raw, name="photo.jpg"))
     if msg.video:
         name = msg.video.file_name or "video.mp4"
-        raw = (await bot.download(msg.video.file_id)).getvalue()
-        other_attachments.append(Video(raw=raw, name=name))
+        raw = await _download_file(bot, msg.video.file_id, f"video {name}")
+        if raw is not None:
+            other_attachments.append(Video(raw=raw, name=name))
     if msg.document:
         name = msg.document.file_name or "file.bin"
-        raw = (await bot.download(msg.document.file_id)).getvalue()
-        other_attachments.append(File(raw=raw, name=name))
+        raw = await _download_file(bot, msg.document.file_id, f"document {name}")
+        if raw is not None:
+            other_attachments.append(File(raw=raw, name=name))
     if msg.audio:
         name = msg.audio.file_name or "audio.mp3"
-        raw = (await bot.download(msg.audio.file_id)).getvalue()
-        other_attachments.append(File(raw=raw, name=name))
+        raw = await _download_file(bot, msg.audio.file_id, f"audio {name}")
+        if raw is not None:
+            other_attachments.append(File(raw=raw, name=name))
     if msg.voice:
-        raw = (await bot.download(msg.voice.file_id)).getvalue()
-        other_attachments.append(Voice(raw=raw, name="voice.ogg"))
+        raw = await _download_file(bot, msg.voice.file_id, "voice")
+        if raw is not None:
+            other_attachments.append(Voice(raw=raw, name="voice.ogg"))
 
     return photo_attachments, other_attachments
 
