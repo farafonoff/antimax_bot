@@ -282,6 +282,7 @@ class TestWatchdogTick:
     async def test_no_presence_update_yet_is_a_no_op(self):
         ctx = MagicMock()
         ctx.max_ready.is_set.return_value = True
+        ctx.max_transport_connected.return_value = True
         ctx._last_presence_update = 0
 
         await main_module._watchdog_tick(ctx)
@@ -291,6 +292,7 @@ class TestWatchdogTick:
     async def test_fresh_presence_update_does_not_restart(self, monkeypatch):
         ctx = MagicMock()
         ctx.max_ready.is_set.return_value = True
+        ctx.max_transport_connected.return_value = True
         now = 1_000_000.0
         ctx._last_presence_update = now - 10  # well under STUCK_THRESHOLD
         monkeypatch.setattr(main_module.time, "time", lambda: now)
@@ -303,11 +305,12 @@ class TestWatchdogTick:
     async def test_stale_presence_update_forces_restart_using_wall_clock(self, monkeypatch):
         # Regression test: this must compare against time.time() (wall clock,
         # matching how Context sets _last_presence_update), not
-        # asyncio loop.time() (monotonic, a different epoch entirely) --
+        # asyncio.loop.time() (monotonic, a different epoch entirely) --
         # mixing the two made the watchdog never fire.
         ctx = MagicMock()
         ctx.max_client.stop = AsyncMock()
         ctx.max_ready.is_set.return_value = True
+        ctx.max_transport_connected.return_value = True
         now = 1_000_000.0
         ctx._last_presence_update = now - main_module.STUCK_THRESHOLD - 1
         monkeypatch.setattr(main_module.time, "time", lambda: now)
@@ -321,6 +324,7 @@ class TestWatchdogTick:
         ctx = MagicMock()
         ctx.max_client.stop = AsyncMock(side_effect=RuntimeError("already stopped"))
         ctx.max_ready.is_set.return_value = True
+        ctx.max_transport_connected.return_value = True
         now = 1_000_000.0
         ctx._last_presence_update = now - main_module.STUCK_THRESHOLD - 1
         monkeypatch.setattr(main_module.time, "time", lambda: now)
@@ -328,6 +332,45 @@ class TestWatchdogTick:
         await main_module._watchdog_tick(ctx)  # must not raise
 
         assert ctx._last_presence_update == 0
+
+    async def test_a_closed_transport_forces_a_restart_immediately(self):
+        # The gap this closes: MAX's socket dies but pymax hasn't reported a
+        # disconnect, so max_ready still claims MAX is usable and sends fail
+        # with "Not connected to the server" -- for as long as the presence
+        # timestamp stays fresh. The transport knows it's closed, so the
+        # restart happens on the very next tick instead of up to STUCK_THRESHOLD
+        # later.
+        ctx = MagicMock()
+        ctx.max_client.stop = AsyncMock()
+        ctx.max_ready.is_set.return_value = True
+        ctx.max_transport_connected.return_value = False
+        ctx._last_presence_update = 1_000_000.0  # fresh: staleness can't see this
+
+        await main_module._watchdog_tick(ctx)
+
+        ctx.max_client.stop.assert_awaited_once()
+
+    async def test_an_unreadable_transport_is_not_treated_as_down(self, monkeypatch):
+        # None means "no opinion" -- restarting on it would drop a healthy
+        # connection whenever pymax's internals move.
+        ctx = MagicMock()
+        ctx.max_client.stop = AsyncMock()
+        ctx.max_ready.is_set.return_value = True
+        ctx.max_transport_connected.return_value = None
+        now = 1_000_000.0
+        ctx._last_presence_update = now  # fresh, so only the transport could trigger
+        monkeypatch.setattr(main_module.time, "time", lambda: now)
+
+        await main_module._watchdog_tick(ctx)
+
+        ctx.max_client.stop.assert_not_awaited()
+
+    async def test_the_watchdog_ticks_often_enough_to_be_a_backstop(self):
+        # The transport check is free but only useful if it actually runs; at
+        # the old 60s interval a dead connection stayed "ready" for a minute.
+        assert main_module.STUCK_WATCHDOG_INTERVAL <= 30
+        # ...and still slower than a MAX round trip, so it's not a busy loop.
+        assert main_module.STUCK_WATCHDOG_INTERVAL >= 5
 
 
 class TestRunReactionPoll:

@@ -27,6 +27,7 @@ def make_ctx(**overrides):
     ctx.max_client = MagicMock()
     ctx.max_client.send_message = AsyncMock()
     ctx.max_ready.is_set.return_value = True
+    ctx.max_transport_connected.return_value = True
     ctx.db.aget_forward = AsyncMock(return_value={"max_chat_id": "max1", "name": "Family"})
     ctx.db.aset_forward_last_msg_id = AsyncMock()
     ctx.db.aadd_pending_forward = AsyncMock()
@@ -97,9 +98,34 @@ class TestForwardChannelToMax:
 
         ctx.max_send.assert_not_awaited()
         ctx.db.aset_forward_last_msg_id.assert_not_awaited()
+        # attempts=0: nothing was actually sent, so this isn't a failed attempt.
         ctx.db.aadd_pending_forward.assert_awaited_once_with(
-            -100123, 5, "hello", None, None, None, None
+            -100123, 5, "hello", None, None, None, None, 0
         )
+
+    async def test_a_closed_transport_queues_the_post_without_attempting_it(self):
+        # `max_ready` lags the socket dying (pymax's on_disconnect isn't
+        # prompt), and sending into that window is what used to lose posts.
+        ctx = make_ctx()
+        ctx.max_transport_connected.return_value = False
+        msg = make_message(chat=MagicMock(id=-100123), text="hello", message_id=5)
+
+        await forward_channel_to_max(ctx, msg)
+
+        ctx.max_send.assert_not_awaited()
+        ctx.db.aadd_pending_forward.assert_awaited_once_with(
+            -100123, 5, "hello", None, None, None, None, 0
+        )
+
+    async def test_an_unreadable_transport_still_sends(self):
+        # None means "no opinion" -- it must never block a delivery.
+        ctx = make_ctx()
+        ctx.max_transport_connected.return_value = None
+        msg = make_message(chat=MagicMock(id=-100123), text="hello", message_id=5)
+
+        await forward_channel_to_max(ctx, msg)
+
+        ctx.max_send.assert_awaited_once_with("max1", "hello")
 
     async def test_max_not_ready_queues_media_post_with_its_file_id(self):
         ctx = make_ctx()
@@ -112,7 +138,7 @@ class TestForwardChannelToMax:
         await forward_channel_to_max(ctx, msg)
 
         ctx.db.aadd_pending_forward.assert_awaited_once_with(
-            -100123, 6, "look", "video", "v1", "clip.mp4", None
+            -100123, 6, "look", "video", "v1", "clip.mp4", None, 0
         )
 
     async def test_no_forward_configured_does_not_queue_either(self):
@@ -350,15 +376,28 @@ class TestChannelForwardReceipts:
         spy_receipts.mark_queued.assert_awaited_once_with(ctx, -100123, 42, "max1")
         spy_receipts.mark_sent.assert_not_awaited()
 
-    async def test_send_failure_marks_the_receipt_failed(self, spy_receipts):
+    async def test_send_failure_queues_the_post_for_replay(self, spy_receipts):
+        # The load-bearing case: MAX's transport can die without max_ready
+        # being cleared in time, so the live send raises. Dropping the post
+        # here loses it for good (no way to refetch channel history) -- it must
+        # land in pending_forwards so a reconnect replays it.
         ctx = make_ctx()
         ctx.max_send = AsyncMock(side_effect=RuntimeError("MAX API down"))
         msg = make_message(chat=MagicMock(id=-100123), text="news", message_id=42)
 
         await forward_channel_to_max(ctx, msg)
 
-        spy_receipts.mark_failed.assert_awaited_once_with(ctx, -100123, 42, "MAX API down")
+        # attempts=1: a delivery really was attempted and failed.
+        ctx.db.aadd_pending_forward.assert_awaited_once_with(
+            -100123, 42, "news", None, None, None, None, 1
+        )
+        spy_receipts.mark_queued.assert_awaited_once_with(
+            ctx, -100123, 42, "max1", error="MAX API down"
+        )
         spy_receipts.mark_sent.assert_not_awaited()
+        spy_receipts.mark_failed.assert_not_awaited()
+        # The watermark must not advance, or replay would consider it handled.
+        ctx.db.aset_forward_last_msg_id.assert_not_awaited()
 
     async def test_delivery_without_a_reported_id_is_still_marked_sent(self, spy_receipts):
         ctx = make_ctx()
@@ -605,4 +644,24 @@ class TestForwardChannelAlbum:
         # ...but only one receipt, keyed on the anchor.
         spy_receipts.mark_queued.assert_awaited_once()
         assert spy_receipts.mark_queued.await_args.args[2] == 100
+        ctx.db.aset_forward_last_msg_id.assert_not_awaited()
+
+    async def test_a_failed_album_queues_every_item(self, monkeypatch, spy_receipts):
+        # A send that fails mid-album must not lose the album: all of its items
+        # are queued (grouped, so replay rebuilds one MAX album), each counting
+        # as one spent attempt.
+        ctx = make_ctx()
+        ctx.bot.download = AsyncMock(return_value=MagicMock(getvalue=lambda: b"img"))
+        ctx.max_client.send_message = AsyncMock(
+            side_effect=RuntimeError("Failed to request photo upload URL")
+        )
+        chat = MagicMock(id=-100123)
+
+        await self.feed(ctx, self.album_items(chat, count=3), monkeypatch)
+
+        assert ctx.db.aadd_pending_forward.await_count == 3
+        assert {c.args[6] for c in ctx.db.aadd_pending_forward.await_args_list} == {"g1"}
+        assert {c.args[7] for c in ctx.db.aadd_pending_forward.await_args_list} == {1}
+        spy_receipts.mark_queued.assert_awaited_once()
+        assert spy_receipts.mark_queued.await_args.args[2] == 100  # the anchor
         ctx.db.aset_forward_last_msg_id.assert_not_awaited()

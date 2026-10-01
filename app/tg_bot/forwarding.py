@@ -70,6 +70,24 @@ async def forward_prepared_post(
     )
 
 
+async def _queue_post(ctx: Context, tg_channel_id: int, messages: list[Message], *, attempted: bool) -> None:
+    """Persist a channel post for replay.
+
+    `attempted` says whether a delivery was already tried and failed (as
+    opposed to MAX simply not being reachable), which is recorded as the post's
+    first attempt so a post that keeps failing can eventually be given up on.
+    """
+    # One pending row per item -- each carries its own file_id to re-download
+    # -- tagged with the group so replay can rebuild the album.
+    for msg in messages:
+        kind, file_id, file_name = describe_tg_media(msg)
+        await ctx.db.aadd_pending_forward(
+            tg_channel_id, msg.message_id, msg.text or msg.caption or "",
+            kind, file_id, file_name, getattr(msg, "media_group_id", None),
+            1 if attempted else 0,
+        )
+
+
 async def deliver_channel_post(ctx: Context, messages: list[Message]) -> None:
     """Forward one channel post -- or one whole album -- to its MAX chat.
 
@@ -78,10 +96,11 @@ async def deliver_channel_post(ctx: Context, messages: list[Message]) -> None:
     forward receipt is keyed on, so an album produces one receipt rather than
     one per photo.
 
-    If MAX isn't reachable right now the post is queued (`pending_forwards`)
-    instead of dropped: Telegram delivers channel_post updates live regardless
-    of MAX's state, and there is no Bot API to retroactively fetch a channel's
-    history, so this is the only way to recover it later.
+    If the post can't be delivered -- MAX isn't reachable, or the send raises --
+    it is queued (`pending_forwards`) instead of dropped: Telegram delivers
+    channel_post updates live regardless of MAX's state, and there is no Bot
+    API to retroactively fetch a channel's history, so this is the only way to
+    recover it later.
     """
     anchor = messages[0]
     chat = anchor.chat
@@ -101,19 +120,20 @@ async def deliver_channel_post(ctx: Context, messages: list[Message]) -> None:
         max_chat_id=max_chat_id, max_chat_name=forward.get("name"),
     )
 
-    if ctx.max_client is None or not ctx.max_ready.is_set():
+    # `max_ready` alone isn't enough: it clears on pymax's disconnect event,
+    # which lags the socket actually dying, and attempting a send in that
+    # window fails (and, with no way to refetch channel history, would lose
+    # the post). The transport knows its own state without a round trip.
+    transport_down = ctx.max_transport_connected() is False
+    if ctx.max_client is None or not ctx.max_ready.is_set() or transport_down:
         log.warning(
-            "Channel forward: MAX not ready for chat %s, queuing post %s (%d item(s)) for replay",
-            chat.id, anchor.message_id, len(messages),
+            "Channel forward: MAX not usable for chat %s (%s), queuing post %s "
+            "(%d item(s)) for replay",
+            chat.id,
+            "transport closed" if transport_down else "not ready",
+            anchor.message_id, len(messages),
         )
-        # One pending row per item -- each carries its own file_id to
-        # re-download -- tagged with the group so replay can rebuild the album.
-        for msg in messages:
-            kind, file_id, file_name = describe_tg_media(msg)
-            await ctx.db.aadd_pending_forward(
-                chat.id, msg.message_id, msg.text or msg.caption or "",
-                kind, file_id, file_name, getattr(msg, "media_group_id", None),
-            )
+        await _queue_post(ctx, chat.id, messages, attempted=False)
         # Only the anchor's receipt: the album is one MAX message, so it gets
         # one receipt, and that's the one replay will flip to delivered.
         await receipts.mark_queued(ctx, chat.id, anchor.message_id, max_chat_id)
@@ -129,8 +149,14 @@ async def deliver_channel_post(ctx: Context, messages: list[Message]) -> None:
             watermark_msg_id=messages[-1].message_id,
         )
     except Exception as exc:  # noqa: BLE001
+        # MAX can die without `max_ready` being cleared in time (on_disconnect
+        # doesn't always fire promptly), so a send attempted against a dead
+        # transport raises here -- and since there is no way to refetch channel
+        # history, dropping the post would lose it for good. Queue it instead:
+        # replay retries it on the next reconnect.
         log.error("Forward channel->MAX failed (channel=%s): %s", chat.id, exc)
-        await receipts.mark_failed(ctx, chat.id, anchor.message_id, str(exc))
+        await _queue_post(ctx, chat.id, messages, attempted=True)
+        await receipts.mark_queued(ctx, chat.id, anchor.message_id, max_chat_id, error=str(exc))
 
 
 async def _flush_album(ctx: Context, key: tuple[int, str]) -> None:

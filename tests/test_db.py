@@ -40,6 +40,7 @@ class TestSchemaMigrations:
             [row] = db.list_pending_forwards(1)
             assert row["text"] == "queued before the upgrade"
             assert row["media_group_id"] is None
+            assert row["attempts"] == 0  # never retried yet
             # And re-opening doesn't try to add the column twice.
             assert LinksDB(path).list_pending_forwards(1)[0]["media_group_id"] is None
 
@@ -148,6 +149,61 @@ class TestPendingForwards:
         db.del_forward(1)
 
         assert db.list_pending_forwards(1) == []
+
+    def test_requeueing_the_same_post_does_not_duplicate_it(self, db):
+        # The live handler queues on a failed send as well as on MAX being down,
+        # and replay retries without dequeuing on failure -- so the same post
+        # can be queued again while its row is still there. A second row would
+        # be delivered twice by one replay pass.
+        db.add_pending_forward(1, 11, "a", attempts=1)
+        db.add_pending_forward(1, 11, "a", attempts=1)
+
+        pending = db.list_pending_forwards(1)
+
+        assert len(pending) == 1
+        assert pending[0]["attempts"] == 2  # ...and it counts as a retry
+
+    def test_a_different_post_gets_its_own_row(self, db):
+        db.add_pending_forward(1, 11, "a", attempts=2)
+        db.add_pending_forward(1, 12, "b")
+
+        assert [(p["tg_message_id"], p["attempts"]) for p in db.list_pending_forwards(1)] == [
+            (11, 2), (12, 0),
+        ]
+
+    def test_queueing_is_scoped_per_channel(self, db):
+        db.add_pending_forward(1, 11, "a", attempts=3)
+        db.add_pending_forward(2, 11, "a", attempts=3)
+
+        assert db.list_pending_forwards(1)[0]["attempts"] == 3
+        assert db.list_pending_forwards(2)[0]["attempts"] == 3
+
+    def test_bumping_attempts_counts_retries(self, db):
+        # What replay does on a failed send, so a post that never succeeds
+        # eventually hits its cap instead of being retried forever.
+        db.add_pending_forward(1, 11, "a", attempts=1)
+        [row] = db.list_pending_forwards(1)
+
+        db.bump_pending_forward_attempts([row["id"]])
+        db.bump_pending_forward_attempts([row["id"]])
+
+        assert db.list_pending_forwards(1)[0]["attempts"] == 3
+
+    def test_bumping_one_album_item_leaves_the_others_alone(self, db):
+        db.add_pending_forward(1, 11, "", "photo", "p1", None, "g1")
+        db.add_pending_forward(1, 12, "", "photo", "p2", None, "g1")
+        first = db.list_pending_forwards(1)[0]
+
+        db.bump_pending_forward_attempts([first["id"]])
+
+        assert [p["attempts"] for p in db.list_pending_forwards(1)] == [1, 0]
+
+    def test_bumping_nothing_is_a_no_op(self, db):
+        db.add_pending_forward(1, 11, "a", attempts=2)
+
+        db.bump_pending_forward_attempts([])
+
+        assert db.list_pending_forwards(1)[0]["attempts"] == 2
 
 
 class TestForwardReceipts:

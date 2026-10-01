@@ -7,7 +7,7 @@ from app.tg_bot import replay as replay_mod
 
 
 def make_pending(id, tg_message_id, text="", media_kind=None, media_file_id=None,
-                 media_file_name=None, media_group_id=None):
+                 media_file_name=None, media_group_id=None, attempts=0):
     return {
         "id": id,
         "tg_message_id": tg_message_id,
@@ -16,6 +16,7 @@ def make_pending(id, tg_message_id, text="", media_kind=None, media_file_id=None
         "media_file_id": media_file_id,
         "media_file_name": media_file_name,
         "media_group_id": media_group_id,
+        "attempts": attempts,
     }
 
 
@@ -31,6 +32,7 @@ def make_ctx(pending=(), forward=("has",)):
     )
     ctx.db.alist_pending_forwards = AsyncMock(return_value=list(pending))
     ctx.db.adel_pending_forward = AsyncMock()
+    ctx.db.abump_pending_forward_attempts = AsyncMock()
     return ctx
 
 
@@ -158,6 +160,101 @@ async def test_failed_replay_marks_its_receipt_failed(monkeypatch):
     mark_failed.assert_awaited_once_with(ctx, 123, 11, "still down")
     # The post itself stays queued for the next reconnect.
     ctx.db.adel_pending_forward.assert_not_awaited()
+    # ...and the failed try is counted, so it can't be retried forever.
+    ctx.db.abump_pending_forward_attempts.assert_awaited_once_with([1])
+
+
+class TestReplayGivesUpOnAPostThatKeepsFailing:
+    """The live handler now queues on a failed send too, not only while MAX is
+    down. That means a post MAX will never accept (an unsupported attachment,
+    say) would otherwise sit at the head of the queue forever -- replay stops
+    on the first failure, so nothing behind it could ever be delivered."""
+
+    @staticmethod
+    def failing_forward(monkeypatch, failing_text):
+        async def fake_forward(ctx_, max_chat_id, tg_channel_id, tg_message_id, text,
+                               media_source, **_kwargs):
+            if text == failing_text:
+                raise RuntimeError("MAX rejected it")
+
+        monkeypatch.setattr(replay_mod, "forward_prepared_post", fake_forward)
+        monkeypatch.setattr(replay_mod.asyncio, "sleep", AsyncMock())
+
+    async def test_a_post_out_of_attempts_is_dropped_and_the_queue_continues(self, monkeypatch):
+        ctx = make_ctx(pending=[
+            make_pending(id=1, tg_message_id=11, text="poison",
+                         attempts=replay_mod.MAX_ATTEMPTS - 1),
+            make_pending(id=2, tg_message_id=12, text="fine"),
+        ])
+        self.failing_forward(monkeypatch, "poison")
+        mark_failed = AsyncMock()
+        monkeypatch.setattr(replay_mod.receipts, "mark_failed", mark_failed)
+
+        result = await replay_mod.replay_channel_forward(ctx, 123)
+
+        # It burned its last attempt, so it's dequeued rather than retried...
+        ctx.db.adel_pending_forward.assert_any_await(1)
+        # ...and the post behind it still gets delivered.
+        assert result == 1
+        ctx.db.adel_pending_forward.assert_any_await(2)
+
+    async def test_the_final_failure_is_explained_on_the_receipt(self, monkeypatch):
+        ctx = make_ctx(pending=[
+            make_pending(id=1, tg_message_id=11, text="poison",
+                         attempts=replay_mod.MAX_ATTEMPTS - 1),
+        ])
+        self.failing_forward(monkeypatch, "poison")
+        mark_failed = AsyncMock()
+        monkeypatch.setattr(replay_mod.receipts, "mark_failed", mark_failed)
+
+        await replay_mod.replay_channel_forward(ctx, 123)
+
+        (ctx_, channel, msg_id, error) = mark_failed.await_args.args
+        assert (ctx_, channel, msg_id) == (ctx, 123, 11)
+        assert str(replay_mod.MAX_ATTEMPTS) in error
+        assert "MAX rejected it" in error
+
+    async def test_an_album_out_of_attempts_is_dropped_whole(self, monkeypatch):
+        # Never half: a partial album would resend its tail as a separate post.
+        ctx = make_ctx(pending=[
+            make_pending(id=1, tg_message_id=11, media_group_id="g1",
+                         attempts=replay_mod.MAX_ATTEMPTS - 1),
+            make_pending(id=2, tg_message_id=12, media_group_id="g1",
+                         attempts=replay_mod.MAX_ATTEMPTS - 1),
+        ])
+        self.failing_forward(monkeypatch, "")
+        monkeypatch.setattr(replay_mod.receipts, "mark_failed", AsyncMock())
+
+        await replay_mod.replay_channel_forward(ctx, 123)
+
+        assert [c.args[0] for c in ctx.db.adel_pending_forward.await_args_list] == [1, 2]
+
+    async def test_one_attempt_short_of_the_cap_is_still_retried(self, monkeypatch):
+        ctx = make_ctx(pending=[
+            make_pending(id=1, tg_message_id=11, text="poison",
+                         attempts=replay_mod.MAX_ATTEMPTS - 2),
+        ])
+        self.failing_forward(monkeypatch, "poison")
+        monkeypatch.setattr(replay_mod.receipts, "mark_failed", AsyncMock())
+
+        await replay_mod.replay_channel_forward(ctx, 123)
+
+        ctx.db.adel_pending_forward.assert_not_awaited()
+
+    async def test_rows_queued_before_the_column_existed_are_retried(self, monkeypatch):
+        # The migration backfills NULL/0, and a row dict from an older
+        # deployment may not carry the key at all -- neither may be read as
+        # "out of attempts" and dropped without a single try.
+        ctx = make_ctx(pending=[
+            {"id": 1, "tg_message_id": 11, "text": "old", "media_kind": None,
+             "media_file_id": None, "media_file_name": None, "media_group_id": None},
+        ])
+        self.failing_forward(monkeypatch, "old")
+        monkeypatch.setattr(replay_mod.receipts, "mark_failed", AsyncMock())
+
+        await replay_mod.replay_channel_forward(ctx, 123)
+
+        ctx.db.adel_pending_forward.assert_not_awaited()
 
 
 class TestGroupPendingAlbums:
@@ -269,6 +366,7 @@ class TestReplayAlbum:
 
         assert result == 0
         ctx.db.adel_pending_forward.assert_not_awaited()
+        ctx.db.abump_pending_forward_attempts.assert_awaited_once_with([1, 2])
 
     async def test_a_single_queued_post_is_not_wrapped_in_a_list(self, monkeypatch):
         # Regression guard: the non-album path must keep passing one

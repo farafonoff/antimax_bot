@@ -6,6 +6,13 @@ from app.logger import log
 from app.tg_bot.forwarding import forward_prepared_post
 from app.tg_bot.media import rehydrate_tg_media
 
+# How many delivery attempts one queued post gets before replay gives up on it
+# and drops it. Reconnect-driven retries are otherwise unbounded, and a post
+# MAX will never accept (an oversized/unsupported attachment, say) would hold
+# every later post for the channel hostage behind it. The live handler counts
+# its failed send as the first attempt.
+MAX_ATTEMPTS = 5
+
 
 def group_pending_albums(pending: list[dict]) -> list[list[dict]]:
     """Collapse consecutive queued rows that belong to the same media group.
@@ -25,15 +32,31 @@ def group_pending_albums(pending: list[dict]) -> list[list[dict]]:
     return groups
 
 
+def _max_attempts(group: list[dict]) -> int:
+    """Delivery attempts already spent on a group (its items are queued together,
+    so they share a count; the max is the safe read)."""
+    return max(int(p.get("attempts") or 0) for p in group)
+
+
+async def _drop_group(ctx: Context, group: list[dict]) -> None:
+    for post in group:
+        await ctx.db.adel_pending_forward(post["id"])
+
+
 async def replay_channel_forward(ctx: Context, tg_channel_id: int) -> int:
-    """Replay channel posts that were queued (in `pending_forwards`) while
-    MAX was disconnected.
+    """Replay channel posts that were queued (in `pending_forwards`) -- either
+    because MAX was down when they arrived, or because their live send failed.
 
     There is no Bot API to retroactively fetch a channel's history, so
-    recovery relies entirely on `forward_channel_to_max` having queued the
-    post when it arrived live; this just drains that queue in order. Stops
-    on the first failure so a bad post can't be skipped past -- everything
-    from that point on stays queued and is retried on the next reconnect.
+    recovery relies entirely on the live handler having queued the post when it
+    arrived; this just drains that queue in order.
+
+    Stops on the first failure so a bad post can't be skipped past --
+    everything from that point on stays queued and is retried on the next
+    reconnect. The one exception is a group that has burned MAX_ATTEMPTS
+    delivery attempts: MAX is plainly never going to take it, so it's dropped
+    (loudly, and marked failed on its receipt) rather than wedging the queue
+    behind it forever.
     """
     forward = await ctx.db.aget_forward(tg_channel_id)
     if forward is None:
@@ -75,12 +98,29 @@ async def replay_channel_forward(ctx: Context, tg_channel_id: int) -> int:
             replayed += len(group)
             await asyncio.sleep(0.5)  # rate limit
         except Exception as exc:  # noqa: BLE001
+            attempts = _max_attempts(group) + 1
             log.error(
-                "Replay: failed to forward queued post %s (%d item(s)) from channel %s: %s",
-                anchor["tg_message_id"], len(group), tg_channel_id, exc,
+                "Replay: failed to forward queued post %s (%d item(s), attempt %d) "
+                "from channel %s: %s",
+                anchor["tg_message_id"], len(group), attempts, tg_channel_id, exc,
             )
-            await receipts.mark_failed(ctx, tg_channel_id, anchor["tg_message_id"], str(exc))
-            break  # stop on first failure; remaining posts stay queued
+            if attempts < MAX_ATTEMPTS:
+                await ctx.db.abump_pending_forward_attempts([p["id"] for p in group])
+                await receipts.mark_failed(ctx, tg_channel_id, anchor["tg_message_id"], str(exc))
+                break  # stop on first failure; remaining posts stay queued
+            # Out of attempts: drop it so the posts behind it can still be
+            # delivered, and leave the failure on the receipt as the only
+            # remaining trace (the queue row is what we're deleting).
+            log.error(
+                "Replay: giving up on post %s from channel %s after %d attempts; "
+                "dropping it from the queue",
+                anchor["tg_message_id"], tg_channel_id, attempts,
+            )
+            await receipts.mark_failed(
+                ctx, tg_channel_id, anchor["tg_message_id"],
+                f"not delivered after {MAX_ATTEMPTS} attempts: {exc}",
+            )
+            await _drop_group(ctx, group)
 
     log.info("Replay: forwarded %s queued post(s) for channel %s", replayed, tg_channel_id)
     return replayed

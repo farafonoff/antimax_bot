@@ -90,6 +90,29 @@ class Context:
         # Known TG channels/groups where bot was added
         self.known_tg_channels: dict[int, dict] = {}
 
+    def max_transport_connected(self) -> Optional[bool]:
+        """pymax's own transport-level liveness, or None if it can't be read.
+
+        `max_ready` only flips when pymax reports a disconnect, which it
+        doesn't always do promptly -- so between the transport actually dying
+        and `on_disconnect` running, `max_ready` still claims MAX is usable and
+        a send is attempted against a dead socket ("Not connected to the
+        server"). Both pymax transports expose a synchronous `connected`
+        property reflecting the socket, which is exactly the condition that
+        raises that error, so this answers "can I talk to MAX right now?"
+        without spending a round trip.
+
+        None means "no opinion" (no client, or a pymax layout we don't
+        recognise) and must be treated as *don't block* -- the watchdog and the
+        forward paths use it to shorten the window, never to refuse to send.
+        """
+        client = self.max_client
+        if client is None:
+            return None
+        try:
+            return bool(client._connection.transport.connected)
+        except Exception:  # noqa: BLE001
+            return None
 
     # ---- MAX-side helpers -------------------------------------------------
     def name_for(self, chat_id, fallback: str | None = None) -> str:

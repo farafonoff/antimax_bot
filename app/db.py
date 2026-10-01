@@ -73,6 +73,17 @@ class LinksDB:
                 con.commit()
             except sqlite3.OperationalError:
                 pass  # column already exists
+            # Delivery attempts already spent on a queued post. The live handler
+            # queues on a send failure too (not only while MAX is down), so a
+            # post MAX keeps rejecting would otherwise sit at the head of the
+            # queue forever; replay gives up once this passes its cap.
+            try:
+                con.execute(
+                    "ALTER TABLE pending_forwards ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
+                )
+                con.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists
             # One row per channel post we tried to forward, holding the
             # editable feedback message that reports its delivery status and
             # (once MAX reports them) its reactions. Keyed by the source post
@@ -227,7 +238,7 @@ class LinksDB:
             )
             con.commit()
 
-    # posts queued while MAX was disconnected
+    # posts queued while MAX was disconnected, or whose live send failed
     def add_pending_forward(
         self,
         tg_channel_id: int,
@@ -237,16 +248,33 @@ class LinksDB:
         media_file_id: str | None = None,
         media_file_name: str | None = None,
         media_group_id: str | None = None,
+        attempts: int = 0,
     ) -> None:
+        """Queue a post for replay, counting this as one delivery attempt.
+
+        Idempotent per source post: queueing a post that's already queued only
+        bumps `attempts` instead of inserting a second row. Without that, a
+        repeatedly-failing post would be delivered twice by the same replay
+        pass (and `mark_sent`'s upsert would silently converge the receipts).
+        """
         with self._connect() as con:
-            con.execute(
+            inserted = con.execute(
                 "INSERT INTO pending_forwards "
                 "(tg_channel_id, tg_message_id, text, media_kind, media_file_id, "
-                "media_file_name, media_group_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (tg_channel_id, tg_message_id, text, media_kind, media_file_id,
-                 media_file_name, media_group_id),
-            )
+                "media_file_name, media_group_id, attempts) "
+                "SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS ("
+                "SELECT 1 FROM pending_forwards WHERE tg_channel_id = ? AND tg_message_id = ?)",
+                (int(tg_channel_id), int(tg_message_id), text, media_kind, media_file_id,
+                 media_file_name, media_group_id, int(attempts),
+                 int(tg_channel_id), int(tg_message_id)),
+            ).rowcount
+            if not inserted:
+                # Already queued: this is one more attempt at the same post.
+                con.execute(
+                    "UPDATE pending_forwards SET attempts = attempts + 1 "
+                    "WHERE tg_channel_id = ? AND tg_message_id = ?",
+                    (int(tg_channel_id), int(tg_message_id)),
+                )
             con.commit()
 
     def list_pending_forwards(self, tg_channel_id: int) -> list[dict]:
@@ -260,6 +288,24 @@ class LinksDB:
     def del_pending_forward(self, pending_id: int) -> None:
         with self._connect() as con:
             con.execute("DELETE FROM pending_forwards WHERE id = ?", (pending_id,))
+            con.commit()
+
+    def bump_pending_forward_attempts(self, pending_ids: list[int]) -> None:
+        """Record that one more delivery attempt was made at these queued posts.
+
+        Called by replay on failure, so a post that keeps failing eventually
+        reaches replay's attempt cap and is dropped instead of blocking every
+        post behind it.
+        """
+        ids = [int(i) for i in pending_ids]
+        if not ids:
+            return
+        placeholders = ",".join("?" * len(ids))
+        with self._connect() as con:
+            con.execute(
+                f"UPDATE pending_forwards SET attempts = attempts + 1 WHERE id IN ({placeholders})",
+                ids,
+            )
             con.commit()
 
     # forward receipts (delivery feedback + reaction mirror)
@@ -389,11 +435,12 @@ class LinksDB:
         media_file_id: str | None = None,
         media_file_name: str | None = None,
         media_group_id: str | None = None,
+        attempts: int = 0,
     ) -> None:
         await asyncio.to_thread(
             self.add_pending_forward,
             tg_channel_id, tg_message_id, text, media_kind, media_file_id,
-            media_file_name, media_group_id,
+            media_file_name, media_group_id, attempts,
         )
 
     async def alist_pending_forwards(self, tg_channel_id: int) -> list[dict]:
@@ -401,6 +448,9 @@ class LinksDB:
 
     async def adel_pending_forward(self, pending_id: int) -> None:
         await asyncio.to_thread(self.del_pending_forward, pending_id)
+
+    async def abump_pending_forward_attempts(self, pending_ids: list[int]) -> None:
+        await asyncio.to_thread(self.bump_pending_forward_attempts, pending_ids)
 
     async def aget_receipt(self, tg_channel_id: int, tg_message_id: int) -> dict | None:
         return await asyncio.to_thread(self.get_receipt, tg_channel_id, tg_message_id)

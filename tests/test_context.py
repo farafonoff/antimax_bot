@@ -67,6 +67,45 @@ class TestFetchPresenceMap:
         assert result is not None
 
 
+class TestMaxTransportConnected:
+    """`max_ready` is cleared by pymax's disconnect event, which lags the socket
+    actually dying. This reads the transport's own `connected` flag so a send is
+    never attempted into that window -- and reports None, never a guess, when it
+    can't tell."""
+
+    def test_none_without_a_client(self):
+        ctx = make_context()
+        ctx.max_client = None
+
+        assert ctx.max_transport_connected() is None
+
+    def test_false_when_the_socket_is_closed(self):
+        ctx = make_context()
+        client = MagicMock()
+        client._connection.transport.connected = False
+        ctx.max_client = client
+
+        assert ctx.max_transport_connected() is False
+
+    def test_true_when_the_socket_is_open(self):
+        ctx = make_context()
+        client = MagicMock()
+        client._connection.transport.connected = True
+        ctx.max_client = client
+
+        assert ctx.max_transport_connected() is True
+
+    def test_none_when_pymax_internals_move(self):
+        # A truthy stand-in for the old `_app`-style access would read as
+        # "connected" here; anything unreadable must be None so callers treat
+        # it as no opinion rather than as a verdict.
+        ctx = make_context()
+        client = MagicMock(spec=[])
+        ctx.max_client = client
+
+        assert ctx.max_transport_connected() is None
+
+
 class TestTgSendMediaGroup:
     """Regression test: InputMediaPhoto is a frozen pydantic model --
     assigning .caption/.parse_mode after construction raises ValidationError.

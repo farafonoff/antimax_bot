@@ -139,7 +139,9 @@ def render_receipt(row: dict) -> str:
         # Plain hashtag (no markup) so Telegram search can find every receipt
         # for one MAX message.
         lines.append(f"MAX msg: #maxMsgId{html.escape(str(max_message_id))}")
-    if status == STATUS_FAILED and row.get("error"):
+    # A queued post can carry the send failure that caused the queueing (see
+    # mark_queued), so the reason is shown for both non-delivered statuses.
+    if row.get("error") and status in (STATUS_FAILED, STATUS_QUEUED):
         lines.append(f"Ошибка: <code>{html.escape(str(row['error']))[:300]}</code>")
     reactions = row.get("reactions")
     lines.append(f"Реакции: {reactions}" if reactions else "Реакции: <i>пока нет</i>")
@@ -289,15 +291,17 @@ async def mark_failed(ctx, tg_channel_id: int, tg_message_id: int, error: str) -
 
 
 @_never_fails
-async def mark_queued(ctx, tg_channel_id: int, tg_message_id: int, max_chat_id=None) -> None:
-    """MAX was down, so the post went to `pending_forwards` instead of being
-    sent; the receipt says so until a replay pass flips it."""
+async def mark_queued(ctx, tg_channel_id: int, tg_message_id: int, max_chat_id=None, error: str | None = None) -> None:
+    """The post went to `pending_forwards` instead of being sent; the receipt
+    says so until a replay pass flips it. `error` is the send failure that
+    caused the queueing, when there was one."""
     if not receipts_enabled(ctx):
         return
     row = await ctx.db.aupsert_receipt(
         tg_channel_id, tg_message_id,
         max_chat_id=None if max_chat_id is None else str(max_chat_id),
         status=STATUS_QUEUED,
+        error=None if error is None else str(error)[:500],
     )
     await _render_and_sync(ctx, row)
 

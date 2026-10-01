@@ -28,7 +28,7 @@ def _ensure_dirs(settings):
 TOKEN_ROTATE_INTERVAL = 12 * 3600  # periodic re-login rotates the MAX token
 AUTH_FAILURE_COOLDOWN = 180          # pause before asking MAX for a fresh SMS code
 ATTEMPT_LIMIT_COOLDOWN = 300         # longer pause when MAX says "attempt limit reached"
-STUCK_WATCHDOG_INTERVAL = 60         # check for stuck connection every 60s
+STUCK_WATCHDOG_INTERVAL = 15         # check for a dead connection every 15s
 STUCK_THRESHOLD = 120                # consider stuck if no presence update for 120s
 # MAX doesn't push opcode 155 for messages the bridge posts into a channel, so
 # polling is the only way reactions ever reach a receipt -- not a backstop for
@@ -163,25 +163,38 @@ async def run_reaction_poll(ctx: Context) -> None:
 
 
 async def _watchdog_tick(ctx: Context) -> None:
-    """One check: if MAX is 'ready' but hasn't produced a presence update in
-    STUCK_THRESHOLD seconds, the transport is likely stuck silently -> force
-    a restart so run_max's reconnect logic kicks in."""
+    """One check for a MAX connection that is 'ready' but not actually usable.
+
+    Two independent signals, because they fail in different situations:
+      * the transport says it isn't connected -- the socket died but pymax
+        hasn't reported a disconnect yet, which is exactly the window in which
+        a send is attempted against a dead connection and fails;
+      * no presence update for STUCK_THRESHOLD seconds -- the socket looks
+        fine but the server has gone silent (the original reason this loop
+        exists, since MAX's `on_disconnect` hook doesn't always fire).
+
+    Either way, force-stop the client so run_max's reconnect logic kicks in.
+    """
     if ctx.max_client is None or not ctx.max_ready.is_set():
         return
-    # Use the tracked timestamp from presence poll
-    if ctx._last_presence_update > 0:
+    reason = None
+    if ctx.max_transport_connected() is False:
+        reason = "transport reports the connection is closed"
+    elif ctx._last_presence_update > 0:
         now = time.time()
         if now - ctx._last_presence_update > STUCK_THRESHOLD:
-            log.warning(
-                "Watchdog: MAX connection appears stuck (no presence update for %ds), forcing restart",
-                STUCK_THRESHOLD,
-            )
-            try:
-                await ctx.max_client.stop()
-            except Exception as exc:  # noqa: BLE001
-                log.debug("watchdog stop failed: %s", exc)
-            # Reset timestamp so we don't spam restarts
-            ctx._last_presence_update = 0
+            reason = f"no presence update for {STUCK_THRESHOLD}s"
+    if reason is None:
+        return
+    log.warning(
+        "Watchdog: MAX connection is not usable (%s), forcing restart", reason,
+    )
+    try:
+        await ctx.max_client.stop()
+    except Exception as exc:  # noqa: BLE001
+        log.debug("watchdog stop failed: %s", exc)
+    # Reset timestamp so we don't spam restarts
+    ctx._last_presence_update = 0
 
 
 async def run_watchdog(ctx: Context) -> None:
