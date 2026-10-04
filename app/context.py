@@ -3,15 +3,18 @@ from __future__ import annotations
 import asyncio
 import time
 from datetime import datetime
+from io import BytesIO
 from typing import Any, Optional
 
 from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.types import InputFile
 from pymax import Client
 from pymax.types import Name
 from pymax.types.domain import PhotoAttachment, Presence
 
+from app.auth_flow import AuthCoordinator
 from app.db import LinksDB
 from app.logger import log
 from app.sms_provider import SmsInbox
@@ -24,6 +27,7 @@ PRESENCE_EDIT_INTERVAL = 90  # seconds between edits of the live presence messag
 STATUS_ONLINE_WINDOW = 300  # seen within this window counts as "online"
 PRESENCE_MSG_KEY = "__presence_feed_msg__"  # links-table key for the live msg id
 FORWARDS_FEED_KEY = "__forwards_feed__"  # links-table key for the receipts topic
+QR_LOGIN_KEY = "__qr_login_msg__"  # links-table key for the current login-QR msg id
 
 
 def forwards_feed_key(tg_channel_id: int) -> str:
@@ -53,6 +57,10 @@ class Context:
         self.bot: Bot = bot
         self.db: LinksDB = db
         self.sms: SmsInbox = sms
+        # Which way to authenticate when MAX needs a login (QR by default).
+        # Lives here, not in the flow, because the client is rebuilt on every
+        # reconnect and a /login sms must not be forgotten by that rebuild.
+        self.auth: AuthCoordinator = AuthCoordinator()
 
         self.max_client: Optional[Client] = None
         self.max_ready: asyncio.Event = asyncio.Event()
@@ -540,6 +548,64 @@ class Context:
                 parse_mode=ParseMode.HTML,
             )
         )
+
+    async def tg_replace_qr(self, png: bytes, caption_html: str) -> Optional[int]:
+        """Publish the MAX login QR into the logs topic, replacing any previous one.
+
+        Replaced rather than edited, and that is the point: every auth attempt
+        gets a *different* QR link, the old one is dead within seconds, and
+        Telegram cannot turn one photo into a different photo anyway (`edit_media`
+        would still leave the stale code visible if it failed). Deleting first
+        also means a stale QR can never be scanned by mistake -- and with it the
+        promise that it still works.
+
+        The current message id is persisted in `links`, not just cached, so a
+        restart still finds and clears a QR left over from the previous process.
+        A delete failure (no rights, already gone) is not fatal: the new QR still
+        gets posted, which is the part that matters.
+        """
+        tid = await self.get_or_create_logs_feed_topic()
+        if tid is None:
+            return None
+        row = await self.db.aget_link(QR_LOGIN_KEY)
+        old_id = int(row["tg_topic_id"]) if row and row.get("tg_topic_id") else None
+        if old_id:
+            try:
+                await self.bot.delete_message(chat_id=self.group_id, message_id=old_id)
+                log.info("Deleted previous login QR message %s", old_id)
+            except TelegramBadRequest as exc:
+                log.debug("previous QR message %s not deletable: %s", old_id, exc)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("could not delete previous QR message %s: %s", old_id, exc)
+        msg = await self._safe(
+            lambda: self.bot.send_photo(
+                chat_id=self.group_id,
+                photo=InputFile(BytesIO(png), filename="max-login-qr.png"),
+                caption=caption_html,
+                message_thread_id=tid,
+                parse_mode=ParseMode.HTML,
+            )
+        )
+        new_id = getattr(msg, "message_id", None)
+        if new_id:
+            await self.db.aadd_link(QR_LOGIN_KEY, new_id, "MAX login QR")
+        return new_id
+
+    async def tg_clear_qr(self) -> None:
+        """Remove the login QR once it's been accepted (or abandoned).
+
+        Leaving a spent QR in the channel invites someone to scan a dead code and
+        assume the bridge is broken.
+        """
+        row = await self.db.aget_link(QR_LOGIN_KEY)
+        old_id = int(row["tg_topic_id"]) if row and row.get("tg_topic_id") else None
+        await self.db.aadd_link(QR_LOGIN_KEY, 0, "MAX login QR")
+        if not old_id:
+            return
+        try:
+            await self.bot.delete_message(chat_id=self.group_id, message_id=old_id)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("could not clear QR message %s: %s", old_id, exc)
 
     async def tg_send_media_group(
         self, thread_id: int, urls: list[str], caption_html: str | None = None

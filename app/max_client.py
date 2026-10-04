@@ -2,6 +2,7 @@ from pymax import Client, Message, PresenceEvent, ReactionUpdateEvent, ExtraConf
 from pymax.types import PhotoAttachment, VideoAttachment, AudioAttachment, FileAttachment, StickerAttachment
 
 from app import receipts
+from app.auth_flow import BridgeAuthFlow, TelegramQrHandler
 from app.logger import log
 from app.context import Context
 
@@ -16,11 +17,20 @@ def _inject_no_forward_tag(text: str, sent: bool) -> str:
 
 
 def build_max_client(ctx: Context) -> Client:
+    auth_flow = BridgeAuthFlow(
+        ctx=ctx,
+        coordinator=ctx.auth,
+        qr_handler=TelegramQrHandler(ctx),
+        sms=ctx.sms,
+    )
     client = Client(
         phone=ctx.settings.max_phone,
         session_name=ctx.settings.max_session_name,
         work_dir=ctx.settings.max_work_dir,
         sms_code_provider=ctx.sms,
+        # Only ever consulted when the session store comes back empty, so this
+        # cannot disturb an account that is already logged in.
+        auth_flow=auth_flow,
         # Force a fresh presence (online/last-seen) snapshot on every login,
         # even with a cached session. Chats still load from the saved sync marker.
         extra_config=ExtraConfig(sync=SyncOverrides(presence_sync=-1)),

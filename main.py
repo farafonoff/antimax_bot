@@ -308,6 +308,18 @@ async def main() -> None:
 
     sms.on_request = _on_sms_requested
 
+    async def _on_password_requested(hint: str | None) -> None:
+        ctx.note_connectivity(
+            "🔐 <b>MAX просит пароль 2FA</b>"
+            + (f"\nПодсказка: <code>{hint}</code>\n" if hint else "\n")
+            + "Отправьте его в эту группу:  /password &lt;пароль&gt;"
+        )
+
+    # Not awaited: pymax calls this from inside the auth flow, which is itself
+    # running under _run_max_cycle -- and the default it replaces would have
+    # blocked on stdin forever under Docker.
+    ctx.auth.password.on_request = _on_password_requested
+
     # Forward WARNING/ERROR logs (app+pymax+aiogram) to the Telegram feed so
     # MAX-side failures are never silent on an unattended VPS.
     tg_log_task = start_tg_log_worker(ctx, settings.tg_log_level)

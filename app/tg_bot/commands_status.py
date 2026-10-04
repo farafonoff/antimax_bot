@@ -48,7 +48,12 @@ def register(dp: Dispatcher, ctx: Context) -> None:
             "• В исходный канал бот <b>ничего</b> не пишет.\n\n"
             "<b>4. Система / Статус</b>\n"
             "/status — статус MAX подключения и привязок\n"
-            "/sms <code>код</code> — ввести код SMS для входа в MAX\n"
+            "/login — как сейчас идёт вход в MAX\n"
+            "/login qr — прислать новый QR-код для входа\n"
+            "/login sms — запросить вход по SMS (код придёт в тему «MAX logs»)\n"
+            "/sms <code>код</code> — ввести код SMS\n"
+            "/password <code>пароль</code> — ввести пароль 2FA\n"
+            "• Обычно вход не нужен: MAX помнит сессию. QR приходит в тему «MAX logs» сам,\n  и каждый следующий код заменяет предыдущий.\n"
             "/presence [<code>user_id</code>] — статус контактов (живая лента в теме «MAX presence»)\n\n"
             "<b>Как узнать ID:</b>\n"
             "• MAX chat_id: /max_chats_full или в /max chats (👤 = личный чат, chat_id == user_id)\n"
@@ -64,8 +69,19 @@ def register(dp: Dispatcher, ctx: Context) -> None:
         if ctx.sms.state.value != "idle":
             await ctx.tg_reply(
                 message,
-                f"MAX: 🔐 вход не завершён (состояние: <code>{ctx.sms.state.value}</code>). "
-                "Ожидается /sms &lt;код&gt;.",
+                f"MAX: 🔐 вход не завершён (состояние: <code>{ctx.sms.state.value}</code>, "
+                f"способ: <code>{ctx.auth.describe()}</code>). Ожидается /sms &lt;код&gt;.",
+            )
+            return
+        if ctx.max_client is not None and not ctx.max_ready.is_set():
+            # Not an SMS wait, so /status used to call this "не подключён" and
+            # stop -- while the bridge was in fact waiting for a QR scan.
+            await ctx.tg_reply(
+                message,
+                "MAX: 🔐 ожидает входа (<code>"
+                + ctx.auth.describe()
+                + "</code>). QR-код — в теме «MAX logs»; "
+                "<code>/login qr</code> — новый, <code>/login sms</code> — SMS.",
             )
             return
         if ctx.max_client is None or not ctx.max_ready.is_set():
@@ -94,6 +110,59 @@ def register(dp: Dispatcher, ctx: Context) -> None:
                 "⚠️ MAX сейчас не запрашивает код (состояние: "
                 f"<code>{ctx.sms.state.value}</code>). Код не принят.",
             )
+
+    @dp.message(Command(commands=["login"]))
+    async def _cmd_login(message: Message) -> None:
+        if not (is_owner(message, ctx) and in_group(message, ctx)):
+            return
+        parts = message.text.split(maxsplit=1)
+        arg = parts[1].strip().lower() if len(parts) > 1 else ""
+        if arg in ("", "status"):
+            await ctx.tg_reply(
+                message,
+                "🔐 <b>Вход в MAX</b>\n"
+                f"Текущий способ: <code>{ctx.auth.describe()}</code>\n"
+                "• <code>/login qr</code> — новый QR-код прямо сейчас\n"
+                "• <code>/login sms</code> — запросить SMS с кодом\n"
+                "Код из SMS: <code>/sms &lt;код&gt;</code>. "
+                "Пароль 2FA: <code>/password &lt;пароль&gt;</code>.\n"
+                + (
+                    "MAX подключён — вход не требуется."
+                    if ctx.max_ready.is_set()
+                    else "MAX ждёт входа: код уже в теме «MAX logs»."
+                ),
+            )
+            return
+        if arg == "qr":
+            # Wakes the flow out of its poll loop, so a fresh code is issued now
+            # rather than whenever the current one happens to expire.
+            ctx.auth.request_qr()
+            await ctx.tg_reply(message, "🔐 Запрошен новый QR-код — он придёт в тему «MAX logs».")
+            return
+        if arg == "sms":
+            ctx.auth.request_sms()
+            await ctx.tg_reply(
+                message,
+                "📩 Запрошен вход по SMS: как только MAX пришлёт код, придёт "
+                "уведомление в теме «MAX logs». Введите его через <code>/sms &lt;код&gt;</code>.",
+            )
+            return
+        await ctx.tg_reply(message, "Использование: <code>/login qr</code> или <code>/login sms</code>")
+
+    @dp.message(Command(commands=["password"]))
+    async def _cmd_password(message: Message) -> None:
+        if not (is_owner(message, ctx) and in_group(message, ctx)):
+            return
+        parts = message.text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await ctx.tg_reply(message, "Использование: <code>/password &lt;пароль&gt;</code>")
+            return
+        if await ctx.auth.password.set(parts[1].strip()):
+            await ctx.tg_reply(message, "✅ Пароль 2FA передан MAX.")
+        else:
+            # The obvious failure here would be pymax's ConsolePasswordProvider,
+            # which prompts on stdin and would hang forever under Docker.
+            await ctx.tg_reply(message, "⚠️ MAX сейчас не запрашивает пароль 2FA. Пароль не принят.")
 
     @dp.message(Command(commands=["presence"]))
     async def _cmd_presence(message: Message) -> None:
