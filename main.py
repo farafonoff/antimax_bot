@@ -30,6 +30,7 @@ AUTH_FAILURE_COOLDOWN = 180          # pause before asking MAX for a fresh SMS c
 ATTEMPT_LIMIT_COOLDOWN = 300         # longer pause when MAX says "attempt limit reached"
 STUCK_WATCHDOG_INTERVAL = 15         # check for a dead connection every 15s
 STUCK_THRESHOLD = 120                # consider stuck if no presence update for 120s
+REPLAY_POLL_INTERVAL = 30            # how often the reconnect-replay loop looks
 # MAX doesn't push opcode 155 for messages the bridge posts into a channel, so
 # polling is the only way reactions ever reach a receipt -- not a backstop for
 # outages. Hence a tight interval, and a short first pass so a restart doesn't
@@ -133,10 +134,20 @@ async def _reconnect_replay_tick(ctx: Context, was_disconnected: bool) -> bool:
 
 
 async def run_replay_on_reconnect(ctx: Context) -> None:
-    """After MAX reconnects, replay missed channel forwards."""
-    was_disconnected = False
+    """After MAX reconnects, replay missed channel forwards.
+
+    Starts at True: from this process's point of view MAX has not been observed
+    ready yet, so the first tick that sees it up counts as a reconnect and
+    drains the queue. This matters because `pending_forwards` survives restarts
+    in sqlite while this trigger only ever fires on a transition observed
+    in-process -- with False, a queue that outlived the process sat undelivered
+    (receipts stuck at "в очереди") until MAX happened to drop and reconnect
+    again. Draining an empty queue is a cheap no-op, so erring towards replaying
+    costs nothing.
+    """
+    was_disconnected = True
     while True:
-        await asyncio.sleep(30)
+        await asyncio.sleep(REPLAY_POLL_INTERVAL)
         was_disconnected = await _reconnect_replay_tick(ctx, was_disconnected)
 
 

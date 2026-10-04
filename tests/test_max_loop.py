@@ -165,6 +165,61 @@ class TestReconnectReplayTick:
         assert result is False
         replay_all.assert_awaited_once_with(ctx)
 
+    async def test_ready_with_no_prior_disconnect_does_not_replay(self, monkeypatch):
+        ctx = MagicMock()
+        ctx.max_ready.is_set.return_value = True
+        replay_all = AsyncMock()
+        monkeypatch.setattr(main_module, "_replay_all_forwards", replay_all)
+
+        result = await main_module._reconnect_replay_tick(ctx, was_disconnected=False)
+
+        assert result is False
+        replay_all.assert_not_awaited()
+
+
+class TestRunReplayOnReconnect:
+    """`pending_forwards` lives in sqlite and outlives the process, but this
+    loop only ever fires on a not-ready -> ready transition it observes itself.
+    If it started out assuming MAX had already been seen up, a queue carried
+    across a restart would sit undelivered -- receipts stuck at "в очереди" --
+    until MAX happened to drop and reconnect again while the loop was running.
+    """
+
+    async def test_a_queue_surviving_a_restart_is_replayed_once_max_is_up(self, monkeypatch):
+        ctx = make_ctx()
+        ctx.max_ready = asyncio.Event()  # clear, as it is on a fresh process
+        ctx.max_ready.set()              # ...and up by the time the first tick runs
+        replay_all = AsyncMock()
+        monkeypatch.setattr(main_module, "_replay_all_forwards", replay_all)
+        monkeypatch.setattr(
+            main_module.asyncio, "sleep", AsyncMock(side_effect=lambda _s: None)
+        )
+        ticks = []
+
+        async def fake_tick(_ctx, was_disconnected):
+            ticks.append(was_disconnected)
+            if len(ticks) == 2:
+                raise asyncio.CancelledError
+            return True
+
+        monkeypatch.setattr(main_module, "_reconnect_replay_tick", fake_tick)
+
+        with pytest.raises(asyncio.CancelledError):
+            await main_module.run_replay_on_reconnect(ctx)
+
+        # The loop must start out believing it has not yet seen MAX up, or the
+        # first tick reads as "steady state" and the queue is never drained.
+        assert ticks == [True, True]
+
+    async def test_an_empty_queue_makes_the_extra_replay_free(self, monkeypatch):
+        # The reason starting at True is safe: replaying with nothing queued
+        # must not touch anything.
+        ctx = make_ctx()
+        ctx.db.alist_forwards = AsyncMock(return_value=[])
+        monkeypatch.setattr(main_module.asyncio, "sleep", AsyncMock())
+
+        await main_module._replay_all_forwards(ctx)  # must not raise
+
 
 class TestReplayAllForwards:
     async def test_replays_every_forward_and_continues_past_failures(self, monkeypatch):

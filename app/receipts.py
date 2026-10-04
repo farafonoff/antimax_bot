@@ -39,7 +39,10 @@ STATUS_SENT = "sent"
 STATUS_FAILED = "failed"
 
 _STATUS_LABEL = {
-    STATUS_QUEUED: "☐ в очереди (MAX отключён)",
+    # Not "MAX отключён": a post is also queued when MAX was up but the send
+    # itself failed (see forwarding.deliver_channel_post), and the receipt
+    # renders the reason separately when there is one.
+    STATUS_QUEUED: "☐ в очереди (на реплее)",
     STATUS_SENT: "☑️ доставлено в MAX",
     STATUS_FAILED: "☒ не доставлено",
 }
