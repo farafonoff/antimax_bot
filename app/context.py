@@ -81,6 +81,12 @@ class Context:
         self._presence_dirty: bool = True  # something changed -> edit soon
         self._presence_last_edit: float = 0.0
         self._last_presence_update: float = 0.0  # timestamp of last successful fetch_presence_map
+        # When `max_ready` was first observed clear (0 = currently up, or never
+        # went down). The watchdog's hard-restart escalation times against this:
+        # force-stopping the client is not always enough to get MAX talking
+        # again, and a supervisor-level restart has to know how long it has been
+        # down, not just that it is down.
+        self._max_down_since: float = 0.0
         self.self_user_id: Optional[int] = None
         self.max_owner_name: str = "MAX"
         self.bot_id: Optional[int] = None

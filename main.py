@@ -30,6 +30,12 @@ AUTH_FAILURE_COOLDOWN = 180          # pause before asking MAX for a fresh SMS c
 ATTEMPT_LIMIT_COOLDOWN = 300         # longer pause when MAX says "attempt limit reached"
 STUCK_WATCHDOG_INTERVAL = 15         # check for a dead connection every 15s
 STUCK_THRESHOLD = 120                # consider stuck if no presence update for 120s
+# How long MAX may stay unreachable before the process gives up on recovering
+# in-process and exits for docker to replace. Comfortably above run_max's
+# maximum backoff (300s), so a genuinely long outage is allowed to keep backing
+# off rather than being interrupted mid-cycle. Suspended entirely while a login
+# is waiting on a person -- see _escalate_if_stuck.
+HARD_RESTART_AFTER = 420
 REPLAY_POLL_INTERVAL = 30            # how often the reconnect-replay loop looks
 # Shortest gap between two sweeps of a forward queue that is stuck while MAX
 # stays up. The trigger is a successful presence poll (every 60s); this
@@ -259,6 +265,54 @@ async def _watchdog_tick(ctx: Context) -> None:
     ctx._last_presence_update = 0
 
 
+async def _escalate_if_stuck(ctx: Context) -> bool:
+    """Last resort: exit the process if MAX has been unreachable for too long.
+
+    Everything else here is a *soft* recovery -- `run_max` backs off and rebuilds
+    the client, the watchdog force-stops it. Those are not always enough: a
+    connection can wedge in a way that neither a fresh client nor another
+    force-stop clears, and the symptom is a bridge that logs happily forever
+    while delivering nothing. Exiting makes docker-compose's
+    `restart: unless-stopped` build a clean process -- new pymax runtime, new
+    socket, new presence poll. Everything durable lives in sqlite and in
+    pymax's own session store, so a restart costs nothing but the downtime.
+
+    Refuses to fire while MAX is legitimately waiting on a person. A QR code
+    waiting to be scanned looks exactly like a dead connection, and killing the
+    process every few minutes would mean the code could never be scanned at all.
+    That is the whole reason this needs `AuthCoordinator.waiting_for_human` and
+    not just a timer.
+
+    Returns True if the process is exiting (so callers can stop touching ctx).
+    """
+    ready = ctx.max_client is not None and ctx.max_ready.is_set()
+    if ready:
+        ctx._max_down_since = 0.0
+        return False
+    now = time.time()
+    if ctx._max_down_since <= 0:
+        ctx._max_down_since = now
+        return False
+    if ctx.auth.waiting_for_human:
+        # Down, but on purpose -- nobody should be killing this, least of all
+        # the person who is about to scan the code.
+        return False
+    down_for = now - ctx._max_down_since
+    if down_for < HARD_RESTART_AFTER:
+        return False
+    log.error(
+        "MAX has been unreachable for %ds (limit %ds) and the in-process "
+        "reconnect has not recovered it; restarting the process so docker can "
+        "bring up a clean one. State in ./data and ./cache is unaffected.",
+        int(down_for), HARD_RESTART_AFTER,
+    )
+    # os._exit, not sys.exit: this runs inside a supervisor task, and a raised
+    # SystemExit would only unwind this one task -- leaving the bridge limping.
+    # There is nothing to flush: every write is already committed.
+    os._exit(1)
+    return True
+
+
 async def run_watchdog(ctx: Context) -> None:
     """Watch for stuck MAX connection (transport failing but max_ready=True).
     If presence hasn't updated in STUCK_THRESHOLD seconds while ready,
@@ -266,6 +320,7 @@ async def run_watchdog(ctx: Context) -> None:
     while True:
         await asyncio.sleep(STUCK_WATCHDOG_INTERVAL)
         await _watchdog_tick(ctx)
+        await _escalate_if_stuck(ctx)
 
 
 async def run_tg(ctx: Context) -> None:

@@ -108,6 +108,12 @@ class AuthCoordinator:
         # next poll interval.
         self.wake = asyncio.Event()
         self.password = ValueInbox()
+        # True from the moment pymax asks us to authenticate until we produce a
+        # token. Read by the watchdog's hard-restart escalation: MAX is *supposed*
+        # to be unusable while someone is scanning a QR or typing an SMS code, so
+        # a supervisor must not treat that as a wedged connection and kill the
+        # process out from under them.
+        self.waiting_for_human = False
 
     @property
     def mode(self) -> AuthMode:
@@ -200,6 +206,15 @@ class BridgeAuthFlow:
         self.sms = sms
 
     async def authenticate(self, app) -> AuthResult:
+        # Covers every waiting state below (QR poll, SMS code, 2FA password) and
+        # is cleared only once a token exists -- see AuthCoordinator.
+        self.coordinator.waiting_for_human = True
+        try:
+            return await self._authenticate_loop(app)
+        finally:
+            self.coordinator.waiting_for_human = False
+
+    async def _authenticate_loop(self, app) -> AuthResult:
         while True:
             if self.coordinator.mode is AuthMode.SMS:
                 token = await self._sms(app)

@@ -595,3 +595,110 @@ class TestPendingRetry:
         await main_module._pending_retry(ctx)
 
         replay.assert_awaited_once()
+
+
+class TestEscalateIfStuck:
+    """main._escalate_if_stuck: the last-resort process exit.
+
+    Everything else in the supervisor is a soft recovery. This exists because a
+    soft recovery can fail to recover: if `client.stop()` never unwinds
+    `client.start()`, run_max never reaches the rebuild, and the bridge logs
+    cheerfully forever while delivering nothing -- which looks exactly like a
+    connection whose seq counter keeps climbing.
+    """
+
+    def make_ctx(self, ready: bool):
+        ctx = MagicMock()
+        ctx.max_client = MagicMock()
+        ctx.max_ready = asyncio.Event()
+        if ready:
+            ctx.max_ready.set()
+        ctx.auth.waiting_for_human = False
+        ctx._max_down_since = 0.0
+        return ctx
+
+    @staticmethod
+    def patch_exit(monkeypatch, calls):
+        monkeypatch.setattr(main_module.os, "_exit", lambda code: calls.append(code))
+
+    async def test_a_healthy_connection_never_exits(self, monkeypatch):
+        calls = []
+        self.patch_exit(monkeypatch, calls)
+        ctx = self.make_ctx(ready=True)
+        ctx._max_down_since = 1.0  # ancient, to prove readiness wins
+
+        assert await main_module._escalate_if_stuck(ctx) is False
+
+        assert calls == []
+        # ...and the timer is cleared, so an old outage can't count towards a new one.
+        assert ctx._max_down_since == 0.0
+
+    async def test_the_first_sighting_only_starts_the_clock(self, monkeypatch):
+        calls = []
+        self.patch_exit(monkeypatch, calls)
+        ctx = self.make_ctx(ready=False)
+
+        assert await main_module._escalate_if_stuck(ctx) is False
+
+        assert calls == []
+        assert ctx._max_down_since > 0
+
+    async def test_it_exits_once_past_the_limit(self, monkeypatch):
+        calls = []
+        self.patch_exit(monkeypatch, calls)
+        ctx = self.make_ctx(ready=False)
+        ctx._max_down_since = time.time() - main_module.HARD_RESTART_AFTER - 1
+
+        await main_module._escalate_if_stuck(ctx)
+
+        # os._exit, so nothing after it runs; the return value is only there to
+        # keep the function testable.
+        assert calls == [1]
+
+    async def test_it_does_not_exit_just_under_the_limit(self, monkeypatch):
+        calls = []
+        self.patch_exit(monkeypatch, calls)
+        ctx = self.make_ctx(ready=False)
+        ctx._max_down_since = time.time() - main_module.HARD_RESTART_AFTER + 30
+
+        assert await main_module._escalate_if_stuck(ctx) is False
+
+        assert calls == []
+
+    async def test_it_never_exits_while_a_login_is_waiting_on_a_person(self, monkeypatch):
+        # The important one: a QR code sitting in the logs topic waiting to be
+        # scanned is indistinguishable from a dead connection. Restarting on a
+        # timer would delete the code before its owner could ever reach it.
+        calls = []
+        self.patch_exit(monkeypatch, calls)
+        ctx = self.make_ctx(ready=False)
+        ctx._max_down_since = time.time() - main_module.HARD_RESTART_AFTER - 1
+        ctx.auth.waiting_for_human = True
+
+        assert await main_module._escalate_if_stuck(ctx) is False
+
+        assert calls == []
+
+    async def test_the_limit_outlasts_run_maxs_worst_backoff(self):
+        # Otherwise a legitimately slow reconnect gets interrupted mid-cycle and
+        # the process restart-churns through the outage instead of backing off.
+        assert main_module.HARD_RESTART_AFTER > 300
+
+    async def test_the_watchdog_loop_runs_the_escalation(self, monkeypatch):
+        # It has to be wired into the tick loop, not merely defined.
+        ticks = []
+
+        async def fake_tick(_ctx):
+            ticks.append("watchdog")
+
+        async def fake_escalate(_ctx):
+            ticks.append("escalate")
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(main_module, "_watchdog_tick", fake_tick)
+        monkeypatch.setattr(main_module, "_escalate_if_stuck", fake_escalate)
+
+        with pytest.raises(asyncio.CancelledError):
+            await main_module.run_watchdog(MagicMock())
+
+        assert ticks == ["watchdog", "escalate"]
