@@ -1,3 +1,4 @@
+import logging
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -470,3 +471,123 @@ class TestReplayAlbum:
 
         assert not isinstance(captured["media_source"], list)
         assert captured["media_source"].photo[0].file_id == "p1"
+
+
+class TestFailureDiagnostics:
+    """Everything needed to tell *why* a queued post won't send. The interesting
+    detail is inside pymax, so these lock in that it survives being reported."""
+
+    def test_media_description_names_the_attachment_kinds(self):
+        assert replay_mod._describe_media([
+            make_pending(id=1, tg_message_id=11, media_kind="photo", media_file_id="AgACp1234567890abcdef"),
+        ]) == "photo (file_id=AgACp1234567890abcdef…)"
+
+    def test_media_description_counts_repeated_kinds(self):
+        # An album that arrives as N photo rows is one MAX message; the log
+        # should say so rather than list "photo" N times.
+        described = replay_mod._describe_media([
+            make_pending(id=1, tg_message_id=11, media_kind="photo", media_file_id="p1"),
+            make_pending(id=2, tg_message_id=12, media_kind="photo", media_file_id="p2"),
+            make_pending(id=3, tg_message_id=13, media_kind="video", media_file_id="v3"),
+        ])
+        assert described.startswith("photox2, video (file_id=p1…)")
+
+    def test_media_description_says_so_when_the_row_kept_no_file_id(self):
+        # A queued row without a file_id can't be re-downloaded -- worth making
+        # obvious in the log instead of showing up as an empty attachment.
+        described = replay_mod._describe_media([make_pending(id=1, tg_message_id=11, media_kind="photo")])
+        assert "file_id=<none>" in described
+
+    def test_media_description_of_a_text_only_post(self):
+        assert replay_mod._describe_media([make_pending(id=1, tg_message_id=11)]) == (
+            "text only (no attachment)"
+        )
+
+    def test_queued_age_is_read_from_created_at(self):
+        assert replay_mod._queued_age({"created_at": time.time() - 7200}) == pytest.approx(7200, abs=5)
+
+    def test_queued_age_of_a_row_without_a_timestamp_is_zero(self):
+        # Queued before the column existed: report 0, not "forever".
+        assert replay_mod._queued_age({}) == 0.0
+        assert replay_mod._queued_age({"created_at": None}) == 0.0
+
+    @pytest.mark.parametrize("seconds,expected", [(30, "0m"), (3600, "1h"), (86400 * 3, "3d")])
+    def test_age_is_formatted_for_humans(self, seconds, expected):
+        assert replay_mod._fmt_age(seconds) == expected
+
+    def test_pymax_debug_reaches_stdout_while_loud(self, capsys):
+        logger = replay_mod.pymax_logger()
+        record = logging.LogRecord(
+            "pymax.uploads.service", logging.DEBUG, __file__, 1,
+            "Invalid photo upload URL=%s", ("https://upload/xyz",), None,
+        )
+        with replay_mod._loud_pymax():
+            logger.handle(record)
+        # Written straight to stdout, NOT via `log`: Python 3.13 sets a
+        # thread-local in-progress flag for the duration of Logger.handle, and
+        # _is_disabled() drops any log call nested inside a handler -- which is
+        # exactly where a pymax record arrives. Routing through `log` here
+        # silently produces nothing.
+        assert "Invalid photo upload URL=https://upload/xyz" in capsys.readouterr().out
+
+    def test_a_long_pymax_line_is_truncated_and_flattened(self, capsys):
+        logger = replay_mod.pymax_logger()
+        record = logging.LogRecord(
+            "pymax.dispatch", logging.DEBUG, __file__, 1, "frame=%s", ("x" * 5000,), None,
+        )
+        with replay_mod._loud_pymax():
+            logger.handle(record)
+        out = capsys.readouterr().out
+        assert len(out.strip()) < 400
+        assert "\n" not in out.strip()
+
+    def test_pymax_debug_is_not_forwarded_outside_a_replay(self, capsys):
+        # Ordinary live forwards must stay quiet -- this is scoped to replays.
+        record = logging.LogRecord(
+            "pymax.uploads.service", logging.DEBUG, __file__, 1, "chatty", (), None,
+        )
+        replay_mod.pymax_logger().handle(record)
+        assert capsys.readouterr().out == ""
+
+    def test_pymax_debug_is_captured_at_all(self):
+        # pymax sets its logger to INFO, which would drop the very records we
+        # want -- so _loud_pymax must lower it, not just add a handler.
+        logger = replay_mod.pymax_logger()
+        with replay_mod._loud_pymax():
+            assert logger.isEnabledFor(logging.DEBUG)
+            assert any(isinstance(h, replay_mod._PymaxDetail) for h in logger.handlers)
+
+    def test_the_pymax_logger_is_restored_afterwards(self):
+        logger = replay_mod.pymax_logger()
+        level, handlers = logger.level, list(logger.handlers)
+        with replay_mod._loud_pymax():
+            pass
+        assert logger.level == level
+        assert logger.handlers == handlers
+
+    def test_the_pymax_logger_is_restored_even_if_the_send_explodes(self):
+        logger = replay_mod.pymax_logger()
+        level = logger.level
+        with pytest.raises(RuntimeError):
+            with replay_mod._loud_pymax():
+                raise RuntimeError("boom")
+        assert logger.level == level
+        assert not any(isinstance(h, replay_mod._PymaxDetail) for h in logger.handlers)
+
+    async def test_a_failed_replay_logs_the_exception_type_and_media(self, monkeypatch, caplog):
+        # The log line is the only place the reason is visible once the receipt
+        # has moved on, so it has to carry the type, the media and the attempt.
+        ctx = make_ctx(pending=[
+            make_pending(id=1, tg_message_id=11, media_kind="photo", media_file_id="AgACp1"),
+        ])
+        self_error = RuntimeError("Photo upload URL does not contain photoIds")
+        TestReplayFailureHandling.forward_failing(monkeypatch, "", self_error)
+        TestReplayFailureHandling.spy_receipts(monkeypatch)
+
+        with caplog.at_level(logging.ERROR, logger="antimax"):
+            await replay_mod.replay_channel_forward(ctx, 123)
+
+        assert "RuntimeError" in caplog.text
+        assert "photo" in caplog.text
+        assert "attempt 1/100" in caplog.text
+        assert caplog.records[-1].exc_info is not None

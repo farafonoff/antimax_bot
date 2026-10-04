@@ -1,8 +1,12 @@
 import asyncio
+import contextlib
+import logging
+import time
+from datetime import datetime
 
 from app import receipts
 from app.context import Context
-from app.logger import log
+from app.logger import log, pymax_logger
 from app.tg_bot.forwarding import forward_prepared_post
 from app.tg_bot.media import rehydrate_tg_media
 
@@ -87,6 +91,99 @@ async def _drop_group(ctx: Context, group: list[dict]) -> None:
         await ctx.db.adel_pending_forward(post["id"])
 
 
+def _describe_media(group: list[dict]) -> str:
+    """What the queued post actually carries, for the failure log.
+
+    The interesting failures are attachment-upload ones, and "post 40661
+    failed" says nothing about whether the photo, the video or a caption was at
+    fault -- nor whether the queued row even kept its Telegram file_id.
+    """
+    kinds = [p.get("media_kind") for p in group if p.get("media_kind")]
+    if not kinds:
+        return "text only (no attachment)"
+    counts: dict[str, int] = {}
+    for kind in kinds:
+        counts[kind] = counts.get(kind, 0) + 1
+    summary = ", ".join(f"{kind}x{n}" if n > 1 else str(kind) for kind, n in counts.items())
+    file_id = next((p.get("media_file_id") or "" for p in group), "")
+    tail = f"file_id={file_id[:24]}…" if file_id else "file_id=<none>!"
+    return f"{summary} ({tail})"
+
+
+def _queued_age(anchor: dict) -> float:
+    """Seconds since the post was first queued, for the log. Rows written before
+    the column existed report 0 rather than pretending to be ancient."""
+    try:
+        created = float(anchor.get("created_at") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, time.time() - created) if created > 0 else 0.0
+
+
+def _fmt_age(seconds: float) -> str:
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    if seconds < 24 * 3600:
+        return f"{int(seconds // 3600)}h"
+    return f"{int(seconds // 86400)}d"
+
+
+class _PymaxDetail(logging.Handler):
+    """Writes pymax's own DEBUG records to stdout, in our log format.
+
+    The detail that explains these failures is inside pymax, not in our
+    traceback: `upload_photo` logs the offending URL at DEBUG ("Invalid photo
+    upload URL=%s"), which is the only way to tell a malformed URL from an empty
+    one or a rate-limit response -- all three raise the same opaque UploadError.
+
+    Deliberately writes to stdout instead of calling `log.info`. Python 3.13
+    sets a thread-local "in progress" flag for the whole of `Logger.handle`, and
+    `Logger._is_disabled()` returns True while it is set -- so a log call nested
+    inside a handler is silently dropped. Since pymax emits through
+    `Logger.debug`, routing through our logger here would produce nothing at
+    all (verified, not theoretical).
+
+    Goes to stdout only, so it stays out of the Telegram log feed: this is one
+    send's worth of protocol chatter on a post we're already retrying.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            # One line per record, and truncated: pymax dumps whole request
+            # frames at DEBUG, which would bury the line that matters.
+            line = record.getMessage().replace("\n", " ")[:300]
+            print(f"{_fmt_now()} [INFO] pymax.{record.name.removeprefix('pymax.')}: {line}")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _fmt_now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+@contextlib.contextmanager
+def _loud_pymax():
+    """Turn pymax's DEBUG logging on for the duration of one replayed send.
+
+    Scoped to a *replayed* post, which is by definition one we're retrying --
+    ordinary live forwards stay quiet. The logger's level is lowered too,
+    because pymax sets it to INFO and would otherwise drop the records before
+    any handler saw them; it is restored on the way out, including on
+    cancellation, and the Telegram log feed is unaffected (its handler only
+    accepts WARNING+).
+    """
+    logger = pymax_logger()
+    previous = logger.level
+    logger.setLevel(logging.DEBUG)
+    handler = _PymaxDetail()
+    logger.addHandler(handler)
+    try:
+        yield
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+
+
 async def replay_channel_forward(ctx: Context, tg_channel_id: int) -> int:
     """Replay channel posts that were queued (in `pending_forwards`) -- either
     because MAX was down when they arrived, or because their live send failed.
@@ -139,11 +236,12 @@ async def replay_channel_forward(ctx: Context, tg_channel_id: int) -> int:
                 for p in group
             ]
             text = next((p["text"] for p in group if p["text"]), "")
-            await forward_prepared_post(
-                ctx, max_chat_id, tg_channel_id, anchor["tg_message_id"], text,
-                media_sources if len(media_sources) > 1 else media_sources[0],
-                watermark_msg_id=group[-1]["tg_message_id"],
-            )
+            with _loud_pymax():
+                await forward_prepared_post(
+                    ctx, max_chat_id, tg_channel_id, anchor["tg_message_id"], text,
+                    media_sources if len(media_sources) > 1 else media_sources[0],
+                    watermark_msg_id=group[-1]["tg_message_id"],
+                )
             # Only after the whole group landed, so a partial failure leaves
             # every item of the album queued rather than half of it.
             for post in group:
@@ -151,13 +249,18 @@ async def replay_channel_forward(ctx: Context, tg_channel_id: int) -> int:
             replayed += len(group)
             await asyncio.sleep(0.5)  # rate limit
         except Exception as exc:  # noqa: BLE001
+            age = _fmt_age(_queued_age(anchor))
+            media = _describe_media(group)
             if is_max_unreachable(exc):
                 # MAX is down: stop the pass, leave this post at the head of the
                 # queue, and don't charge it an attempt.
                 log.warning(
-                    "Replay: MAX is unreachable (%s); leaving post %s at the head of "
-                    "channel %s's queue (%d post(s) still pending)",
-                    exc, anchor["tg_message_id"], tg_channel_id, len(pending) - replayed,
+                    "Replay: MAX is unreachable (%s: %s) while sending post %s "
+                    "(%d item(s), %s) from channel %s -> MAX chat %s (queued %s ago, "
+                    "%d post(s) still pending); leaving it at the head of the queue",
+                    type(exc).__name__, exc, anchor["tg_message_id"], len(group), media,
+                    tg_channel_id, max_chat_id, age, len(pending) - replayed,
+                    exc_info=exc,
                 )
                 break
             # MAX is up and refused this post -- e.g. its upload endpoint
@@ -168,11 +271,18 @@ async def replay_channel_forward(ctx: Context, tg_channel_id: int) -> int:
             # delivered ahead of it.
             attempts = _max_attempts(group) + 1
             if attempts < MAX_ATTEMPTS:
-                log.error(
-                    "Replay: MAX refused queued post %s (%d item(s)) from channel %s "
-                    "on attempt %d/%d: %s -- keeping it queued at the head",
-                    anchor["tg_message_id"], len(group), tg_channel_id,
-                    attempts, MAX_ATTEMPTS, exc,
+                # exc_info, not just the message: the whole failure is inside
+                # pymax, so the traceback is what says *which* call refused
+                # (upload_photo vs send_message) and via what path. pymax's own
+                # DEBUG lines -- including the URL it choked on -- were echoed
+                # above by _loud_pymax.
+                log.exception(
+                    "Replay: MAX refused queued post %s (%d item(s), %s) from channel %s "
+                    "-> MAX chat %s on attempt %d/%d (queued %s ago): %s: %s "
+                    "-- keeping it queued at the head",
+                    anchor["tg_message_id"], len(group), media, tg_channel_id,
+                    max_chat_id, attempts, MAX_ATTEMPTS, age,
+                    type(exc).__name__, exc,
                 )
                 await ctx.db.abump_pending_forward_attempts([p["id"] for p in group])
                 await receipts.mark_failed(
@@ -183,10 +293,12 @@ async def replay_channel_forward(ctx: Context, tg_channel_id: int) -> int:
             # Out of retries: MAX has answered "no" this many times, so treat the
             # post as undeliverable and skip it, so the channel isn't blocked
             # behind it forever. Logged at ERROR -- this one really is lost.
-            log.error(
-                "Replay: skipping queued post %s (%d item(s)) from channel %s after "
-                "%d refused attempts: %s -- the posts behind it will be delivered",
-                anchor["tg_message_id"], len(group), tg_channel_id, attempts, exc,
+            log.exception(
+                "Replay: skipping queued post %s (%d item(s), %s) from channel %s "
+                "-> MAX chat %s after %d refused attempts (queued %s ago): %s: %s "
+                "-- the posts behind it will be delivered",
+                anchor["tg_message_id"], len(group), media, tg_channel_id, max_chat_id,
+                attempts, age, type(exc).__name__, exc,
             )
             await receipts.mark_failed(
                 ctx, tg_channel_id, anchor["tg_message_id"],
