@@ -1,13 +1,15 @@
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 
 from app.tg_bot import replay as replay_mod
 
 
 
 def make_pending(id, tg_message_id, text="", media_kind=None, media_file_id=None,
-                 media_file_name=None, media_group_id=None, attempts=0):
+                 media_file_name=None, media_group_id=None, attempts=0, age=0.0):
     return {
         "id": id,
         "tg_message_id": tg_message_id,
@@ -17,6 +19,7 @@ def make_pending(id, tg_message_id, text="", media_kind=None, media_file_id=None
         "media_file_name": media_file_name,
         "media_group_id": media_group_id,
         "attempts": attempts,
+        "created_at": time.time() - age,
     }
 
 
@@ -106,7 +109,7 @@ async def test_rehydrates_queued_media_before_forwarding(monkeypatch):
     assert captured["media_source"].photo[0].file_id == "p1"
 
 
-async def test_stops_on_first_failure_and_leaves_it_and_the_rest_queued(monkeypatch):
+async def test_an_unreachable_max_stops_the_pass_and_leaves_the_rest_queued(monkeypatch):
     ctx = make_ctx(pending=[
         make_pending(id=1, tg_message_id=11, text="ok"),
         make_pending(id=2, tg_message_id=12, text="fail"),
@@ -116,7 +119,7 @@ async def test_stops_on_first_failure_and_leaves_it_and_the_rest_queued(monkeypa
     async def fake_forward(ctx_, max_chat_id, tg_channel_id, tg_message_id, text, media_source,
                            **_kwargs):
         if text == "fail":
-            raise RuntimeError("boom")
+            raise ConnectionError("Not connected to the server")
 
     monkeypatch.setattr(replay_mod, "forward_prepared_post", fake_forward)
     monkeypatch.setattr(replay_mod.asyncio, "sleep", AsyncMock())
@@ -124,7 +127,8 @@ async def test_stops_on_first_failure_and_leaves_it_and_the_rest_queued(monkeypa
     result = await replay_mod.replay_channel_forward(ctx, 123)
 
     assert result == 1
-    ctx.db.adel_pending_forward.assert_awaited_once_with(1)  # only the successful one is dequeued
+    # Only the successful one is dequeued; the rest stay put, in order.
+    ctx.db.adel_pending_forward.assert_awaited_once_with(1)
 
 
 async def test_replayed_post_marks_its_receipt_delivered(monkeypatch):
@@ -144,117 +148,182 @@ async def test_replayed_post_marks_its_receipt_delivered(monkeypatch):
     mark_sent.assert_awaited_once_with(ctx, 123, 11, "max1", "777")
 
 
-async def test_failed_replay_marks_its_receipt_failed(monkeypatch):
+async def test_an_unreachable_max_leaves_the_receipt_alone(monkeypatch):
     ctx = make_ctx(pending=[make_pending(id=1, tg_message_id=11, text="fail")])
+    mark_queued = AsyncMock()
     mark_failed = AsyncMock()
+    monkeypatch.setattr(replay_mod.receipts, "mark_queued", mark_queued)
     monkeypatch.setattr(replay_mod.receipts, "mark_failed", mark_failed)
     monkeypatch.setattr(replay_mod.asyncio, "sleep", AsyncMock())
 
     async def fake_forward(*_args, **_kwargs):
-        raise RuntimeError("still down")
+        raise ConnectionError("Not connected to the server")
 
     monkeypatch.setattr(replay_mod, "forward_prepared_post", fake_forward)
 
     await replay_mod.replay_channel_forward(ctx, 123)
 
-    mark_failed.assert_awaited_once_with(ctx, 123, 11, "still down")
-    # The post itself stays queued for the next reconnect.
+    # MAX being down is not the post's fault, so its receipt keeps saying
+    # "в очереди" -- not "не доставлено".
+    mark_queued.assert_not_awaited()
+    mark_failed.assert_not_awaited()
     ctx.db.adel_pending_forward.assert_not_awaited()
-    # ...and the failed try is counted, so it can't be retried forever.
-    ctx.db.abump_pending_forward_attempts.assert_awaited_once_with([1])
+    # Not even an attempt: being unable to reach MAX says nothing about whether
+    # MAX would take it.
+    ctx.db.abump_pending_forward_attempts.assert_not_awaited()
 
 
-class TestReplayGivesUpOnAPostThatKeepsFailing:
-    """The live handler now queues on a failed send too, not only while MAX is
-    down. That means a post MAX will never accept (an unsupported attachment,
-    say) would otherwise sit at the head of the queue forever -- replay stops
-    on the first failure, so nothing behind it could ever be delivered."""
+class TestReplayFailureHandling:
+    """What happens to a queued post that won't send is decided by *whose* fault
+    the error is: an unreachable MAX means every post behind it would fail too
+    (so the post keeps the head of the queue), while a post MAX is up and simply
+    refused is retried but stepped over so it can't block the rest."""
 
     @staticmethod
-    def failing_forward(monkeypatch, failing_text):
+    def spy_receipts(monkeypatch):
+        mark_failed = AsyncMock()
+        mark_queued = AsyncMock()
+        monkeypatch.setattr(replay_mod.receipts, "mark_failed", mark_failed)
+        monkeypatch.setattr(replay_mod.receipts, "mark_queued", mark_queued)
+        return mark_failed, mark_queued
+
+    @staticmethod
+    def forward_failing(monkeypatch, failing_text, exc):
         async def fake_forward(ctx_, max_chat_id, tg_channel_id, tg_message_id, text,
                                media_source, **_kwargs):
             if text == failing_text:
-                raise RuntimeError("MAX rejected it")
+                raise exc
 
         monkeypatch.setattr(replay_mod, "forward_prepared_post", fake_forward)
         monkeypatch.setattr(replay_mod.asyncio, "sleep", AsyncMock())
 
-    async def test_a_post_out_of_attempts_is_dropped_and_the_queue_continues(self, monkeypatch):
+    async def test_an_unreachable_max_leaves_the_post_at_the_head(self, monkeypatch):
         ctx = make_ctx(pending=[
-            make_pending(id=1, tg_message_id=11, text="poison",
-                         attempts=replay_mod.MAX_ATTEMPTS - 1),
-            make_pending(id=2, tg_message_id=12, text="fine"),
+            make_pending(id=1, tg_message_id=11, text="head"),
+            make_pending(id=2, tg_message_id=12, text="behind"),
         ])
-        self.failing_forward(monkeypatch, "poison")
-        mark_failed = AsyncMock()
-        monkeypatch.setattr(replay_mod.receipts, "mark_failed", mark_failed)
+        self.forward_failing(monkeypatch, "head", ConnectionError("Not connected to the server"))
+        mark_failed, _ = self.spy_receipts(monkeypatch)
 
         result = await replay_mod.replay_channel_forward(ctx, 123)
 
-        # It burned its last attempt, so it's dequeued rather than retried...
-        ctx.db.adel_pending_forward.assert_any_await(1)
-        # ...and the post behind it still gets delivered.
+        # Nothing was delivered and nothing was charged to the post -- being
+        # unable to reach MAX says nothing about whether MAX would take it.
+        assert result == 0
+        ctx.db.adel_pending_forward.assert_not_awaited()
+        ctx.db.abump_pending_forward_attempts.assert_not_awaited()
+        # The post behind it isn't even attempted: MAX is down for it too.
+        assert ctx.db.abump_pending_forward_attempts.await_count == 0
+
+    async def test_a_refused_post_is_retried_but_the_queue_moves_past_it(self, monkeypatch):
+        # MAX is up and answered with a malformed upload URL. That says nothing
+        # about the photo, so the post stays queued for a later retry -- but it
+        # must not hold up everything behind it.
+        ctx = make_ctx(pending=[
+            make_pending(id=1, tg_message_id=11, text="flaky"),
+            make_pending(id=2, tg_message_id=12, text="behind"),
+        ])
+        self.forward_failing(
+            monkeypatch, "flaky", RuntimeError("Photo upload URL does not contain photoIds")
+        )
+        mark_failed, mark_queued = self.spy_receipts(monkeypatch)
+
+        result = await replay_mod.replay_channel_forward(ctx, 123)
+
+        # The post behind it was delivered...
         assert result == 1
         ctx.db.adel_pending_forward.assert_any_await(2)
+        # ...while the refused one is still queued (never dequeued), charged one
+        # attempt.
+        assert [c.args[0] for c in ctx.db.adel_pending_forward.await_args_list] == [2]
+        ctx.db.abump_pending_forward_attempts.assert_awaited_once_with([1])
 
-    async def test_the_final_failure_is_explained_on_the_receipt(self, monkeypatch):
+    async def test_a_refused_post_is_reported_as_failed_with_its_attempt_count(self, monkeypatch):
         ctx = make_ctx(pending=[
-            make_pending(id=1, tg_message_id=11, text="poison",
-                         attempts=replay_mod.MAX_ATTEMPTS - 1),
+            make_pending(id=1, tg_message_id=11, text="flaky", attempts=2),
         ])
-        self.failing_forward(monkeypatch, "poison")
-        mark_failed = AsyncMock()
-        monkeypatch.setattr(replay_mod.receipts, "mark_failed", mark_failed)
+        self.forward_failing(monkeypatch, "flaky", RuntimeError("no photoIds"))
+        mark_failed, mark_queued = self.spy_receipts(monkeypatch)
 
         await replay_mod.replay_channel_forward(ctx, 123)
 
+        # "не доставлено" is honest here: MAX is reachable and refused it.
+        mark_queued.assert_not_awaited()
         (ctx_, channel, msg_id, error) = mark_failed.await_args.args
         assert (ctx_, channel, msg_id) == (ctx, 123, 11)
-        assert str(replay_mod.MAX_ATTEMPTS) in error
-        assert "MAX rejected it" in error
+        assert "attempt 3" in error and "no photoIds" in error
 
-    async def test_an_album_out_of_attempts_is_dropped_whole(self, monkeypatch):
+    async def test_nothing_is_ever_dropped_how_often_it_fails(self, monkeypatch):
+        # The regression that cost a real post: MAX's upload endpoint is flaky,
+        # and an attempt budget turned five glitches into permanent data loss.
+        # With the queue advancing past bad posts there is nothing left to wedge,
+        # so a post is retried indefinitely instead of being deleted.
+        ctx = make_ctx(pending=[
+            make_pending(id=1, tg_message_id=11, text="flaky", attempts=999),
+        ])
+        self.forward_failing(monkeypatch, "flaky", RuntimeError("no photoIds"))
+        self.spy_receipts(monkeypatch)
+
+        await replay_mod.replay_channel_forward(ctx, 123)
+
+        ctx.db.adel_pending_forward.assert_not_awaited()
+
+    async def test_a_failed_album_stays_queued_whole_and_the_queue_moves_on(self, monkeypatch):
         # Never half: a partial album would resend its tail as a separate post.
         ctx = make_ctx(pending=[
-            make_pending(id=1, tg_message_id=11, media_group_id="g1",
-                         attempts=replay_mod.MAX_ATTEMPTS - 1),
-            make_pending(id=2, tg_message_id=12, media_group_id="g1",
-                         attempts=replay_mod.MAX_ATTEMPTS - 1),
+            make_pending(id=1, tg_message_id=11, media_group_id="g1"),
+            make_pending(id=2, tg_message_id=12, media_group_id="g1"),
+            make_pending(id=3, tg_message_id=13, text="behind"),
         ])
-        self.failing_forward(monkeypatch, "")
-        monkeypatch.setattr(replay_mod.receipts, "mark_failed", AsyncMock())
+        self.forward_failing(monkeypatch, "", RuntimeError("no photoIds"))
+        self.spy_receipts(monkeypatch)
 
-        await replay_mod.replay_channel_forward(ctx, 123)
+        result = await replay_mod.replay_channel_forward(ctx, 123)
 
-        assert [c.args[0] for c in ctx.db.adel_pending_forward.await_args_list] == [1, 2]
+        assert result == 1
+        assert ctx.db.adel_pending_forward.await_count == 1
+        assert ctx.db.adel_pending_forward.await_args.args[0] == 3
 
-    async def test_one_attempt_short_of_the_cap_is_still_retried(self, monkeypatch):
+    async def test_a_failed_album_is_charged_as_one_group(self, monkeypatch):
         ctx = make_ctx(pending=[
-            make_pending(id=1, tg_message_id=11, text="poison",
-                         attempts=replay_mod.MAX_ATTEMPTS - 2),
+            make_pending(id=1, tg_message_id=11, media_group_id="g1"),
+            make_pending(id=2, tg_message_id=12, media_group_id="g1"),
         ])
-        self.failing_forward(monkeypatch, "poison")
-        monkeypatch.setattr(replay_mod.receipts, "mark_failed", AsyncMock())
+        self.forward_failing(monkeypatch, "", RuntimeError("no photoIds"))
+        self.spy_receipts(monkeypatch)
 
         await replay_mod.replay_channel_forward(ctx, 123)
 
-        ctx.db.adel_pending_forward.assert_not_awaited()
+        ctx.db.abump_pending_forward_attempts.assert_awaited_once_with([1, 2])
 
-    async def test_rows_queued_before_the_column_existed_are_retried(self, monkeypatch):
-        # The migration backfills NULL/0, and a row dict from an older
-        # deployment may not carry the key at all -- neither may be read as
-        # "out of attempts" and dropped without a single try.
-        ctx = make_ctx(pending=[
-            {"id": 1, "tg_message_id": 11, "text": "old", "media_kind": None,
-             "media_file_id": None, "media_file_name": None, "media_group_id": None},
-        ])
-        self.failing_forward(monkeypatch, "old")
-        monkeypatch.setattr(replay_mod.receipts, "mark_failed", AsyncMock())
 
-        await replay_mod.replay_channel_forward(ctx, 123)
+class TestIsMaxUnreachable:
+    """The classifier decides whether the queue keeps its shape, so both
+    directions matter: a false negative advances the queue against a dead MAX, a
+    false positive costs one skipped retry."""
 
-        ctx.db.adel_pending_forward.assert_not_awaited()
+    @pytest.mark.parametrize("exc", [
+        ConnectionError("Not connected to the server"),
+        TimeoutError("timed out"),
+        EOFError(),
+        OSError("Connection reset by peer"),
+        RuntimeError("Not connected to the server"),
+        RuntimeError("connection closed"),
+        RuntimeError("read timeout"),
+        RuntimeError("UploadError: connection aborted"),
+    ])
+    def test_transport_shaped_errors_are_unreachable(self, exc):
+        assert replay_mod.is_max_unreachable(exc) is True
+
+    @pytest.mark.parametrize("exc", [
+        RuntimeError("Photo upload URL does not contain photoIds"),
+        RuntimeError("Failed to request photo upload URL"),
+        RuntimeError("No upload URL received"),
+        RuntimeError("message is too long"),
+        RuntimeError("ApiError: error.code.chat.blocked"),
+    ])
+    def test_post_shaped_errors_are_not_unreachable(self, exc):
+        assert replay_mod.is_max_unreachable(exc) is False
 
 
 class TestGroupPendingAlbums:

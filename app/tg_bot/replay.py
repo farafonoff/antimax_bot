@@ -6,12 +6,39 @@ from app.logger import log
 from app.tg_bot.forwarding import forward_prepared_post
 from app.tg_bot.media import rehydrate_tg_media
 
-# How many delivery attempts one queued post gets before replay gives up on it
-# and drops it. Reconnect-driven retries are otherwise unbounded, and a post
-# MAX will never accept (an oversized/unsupported attachment, say) would hold
-# every later post for the channel hostage behind it. The live handler counts
-# its failed send as the first attempt.
-MAX_ATTEMPTS = 5
+# Errors that mean MAX is unreachable rather than "MAX won't take this post".
+# The distinction decides whether the queue keeps its shape: an unreachable MAX
+# means every post behind the current one would fail too, so the pass stops and
+# the post keeps its place at the head; anything else is that post's own
+# problem, so it is retried but the queue moves past it.
+_TRANSPORT_ERROR_MARKERS = (
+    "not connected",
+    "disconnected",
+    "connection reset",
+    "connection closed",
+    "connection aborted",
+    "connection refused",
+    "broken pipe",
+    "timed out",
+    "timeout",
+    "unexpected eof",
+    "eof",
+)
+
+
+def is_max_unreachable(exc: BaseException) -> bool:
+    """Whether `exc` means MAX is down rather than the post being unacceptable.
+
+    Transport failures surface as a plain `ConnectionError("Not connected to the
+    server")` from pymax's transports, but they also arrive wrapped (pymax
+    re-raises some as `UploadError`/API errors), hence the message check. False
+    positives cost one skipped retry; false negatives cost a queue that tries to
+    advance against a dead MAX, so err towards True.
+    """
+    if isinstance(exc, (ConnectionError, TimeoutError, EOFError, OSError)):
+        return True
+    text = str(exc).lower()
+    return any(marker in text for marker in _TRANSPORT_ERROR_MARKERS)
 
 
 def group_pending_albums(pending: list[dict]) -> list[list[dict]]:
@@ -38,25 +65,30 @@ def _max_attempts(group: list[dict]) -> int:
     return max(int(p.get("attempts") or 0) for p in group)
 
 
-async def _drop_group(ctx: Context, group: list[dict]) -> None:
-    for post in group:
-        await ctx.db.adel_pending_forward(post["id"])
-
-
 async def replay_channel_forward(ctx: Context, tg_channel_id: int) -> int:
     """Replay channel posts that were queued (in `pending_forwards`) -- either
     because MAX was down when they arrived, or because their live send failed.
 
     There is no Bot API to retroactively fetch a channel's history, so
     recovery relies entirely on the live handler having queued the post when it
-    arrived; this just drains that queue in order.
+    arrived; this drains that queue oldest-first.
 
-    Stops on the first failure so a bad post can't be skipped past --
-    everything from that point on stays queued and is retried on the next
-    reconnect. The one exception is a group that has burned MAX_ATTEMPTS
-    delivery attempts: MAX is plainly never going to take it, so it's dropped
-    (loudly, and marked failed on its receipt) rather than wedging the queue
-    behind it forever.
+    What happens on a failure is the whole point, and it splits on *whose* fault
+    the error is (see `is_max_unreachable`):
+
+      * MAX is unreachable -- the post keeps its place at the HEAD of the queue
+        and the pass stops. Nothing behind it could have succeeded either, and
+        the post is not charged an attempt: being unable to reach MAX says
+        nothing about whether MAX would take it.
+      * MAX is reachable but refused this post -- it stays queued for a later
+        retry and the pass MOVES ON to the next post, so one bad post can't hold
+        up everything behind it.
+
+    Nothing is ever dropped: a post that keeps failing is retried on every
+    subsequent reconnect forever, with the attempt count in the log and on its
+    receipt. Dropping it would lose a post that a later retry could well have
+    delivered, which is the worse failure -- and with the queue advancing past
+    bad posts there is no longer a queue to wedge.
     """
     forward = await ctx.db.aget_forward(tg_channel_id)
     if forward is None:
@@ -77,6 +109,7 @@ async def replay_channel_forward(ctx: Context, tg_channel_id: int) -> int:
     )
 
     replayed = 0
+    failed = 0
     for group in groups:
         # The anchor is what the receipt was keyed on when the album was queued.
         anchor = group[0]
@@ -98,29 +131,35 @@ async def replay_channel_forward(ctx: Context, tg_channel_id: int) -> int:
             replayed += len(group)
             await asyncio.sleep(0.5)  # rate limit
         except Exception as exc:  # noqa: BLE001
+            if is_max_unreachable(exc):
+                # MAX is down: stop the pass, leave this post at the head of the
+                # queue, and don't charge it an attempt.
+                log.warning(
+                    "Replay: MAX is unreachable (%s); leaving post %s at the head of "
+                    "channel %s's queue (%d post(s) still pending)",
+                    exc, anchor["tg_message_id"], tg_channel_id, len(pending) - replayed,
+                )
+                break
+            # MAX is up and refused this post -- e.g. its upload endpoint
+            # answering with a malformed URL ("Photo upload URL does not contain
+            # photoIds"), which says nothing about the photo and everything
+            # about that one request. Keep it queued for the next reconnect and
+            # move on to the posts behind it.
             attempts = _max_attempts(group) + 1
             log.error(
-                "Replay: failed to forward queued post %s (%d item(s), attempt %d) "
-                "from channel %s: %s",
-                anchor["tg_message_id"], len(group), attempts, tg_channel_id, exc,
+                "Replay: MAX refused queued post %s (%d item(s)) from channel %s "
+                "on attempt %d: %s -- keeping it queued and moving on",
+                anchor["tg_message_id"], len(group), tg_channel_id, attempts, exc,
             )
-            if attempts < MAX_ATTEMPTS:
-                await ctx.db.abump_pending_forward_attempts([p["id"] for p in group])
-                await receipts.mark_failed(ctx, tg_channel_id, anchor["tg_message_id"], str(exc))
-                break  # stop on first failure; remaining posts stay queued
-            # Out of attempts: drop it so the posts behind it can still be
-            # delivered, and leave the failure on the receipt as the only
-            # remaining trace (the queue row is what we're deleting).
-            log.error(
-                "Replay: giving up on post %s from channel %s after %d attempts; "
-                "dropping it from the queue",
-                anchor["tg_message_id"], tg_channel_id, attempts,
-            )
+            await ctx.db.abump_pending_forward_attempts([p["id"] for p in group])
             await receipts.mark_failed(
                 ctx, tg_channel_id, anchor["tg_message_id"],
-                f"not delivered after {MAX_ATTEMPTS} attempts: {exc}",
+                f"attempt {attempts}: {exc}",
             )
-            await _drop_group(ctx, group)
+            failed += 1
 
-    log.info("Replay: forwarded %s queued post(s) for channel %s", replayed, tg_channel_id)
+    log.info(
+        "Replay: forwarded %s queued post(s) for channel %s (%d still failing)",
+        replayed, tg_channel_id, failed,
+    )
     return replayed
