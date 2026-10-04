@@ -165,30 +165,37 @@ async def run_reaction_poll(ctx: Context) -> None:
 async def _watchdog_tick(ctx: Context) -> None:
     """One check for a MAX connection that is 'ready' but not actually usable.
 
-    Two independent signals, because they fail in different situations:
-      * the transport says it isn't connected -- the socket died but pymax
-        hasn't reported a disconnect yet, which is exactly the window in which
-        a send is attempted against a dead connection and fails;
-      * no presence update for STUCK_THRESHOLD seconds -- the socket looks
-        fine but the server has gone silent (the original reason this loop
-        exists, since MAX's `on_disconnect` hook doesn't always fire).
+    Two signals, because they fail in different situations:
+      * the transport reports itself closed -- the socket is gone while the
+        disconnect event hasn't been reported, so sends raise "Not connected to
+        the server" and the presence poll can't answer either;
+      * no presence update for STUCK_THRESHOLD seconds -- the socket looks fine
+        but the server has gone silent.
 
-    Either way, force-stop the client so run_max's reconnect logic kicks in.
+    The transport flag alone can't be trusted as a *timer* (pymax reports a
+    fresh, not-yet-connected transport while it reconnects, which looks
+    identical), which is why it needs the `max_ready.clear()` below to be safe:
+    that makes a restart one-shot per stale episode. Without it this looped,
+    killing pymax's reconnect every tick and never getting a connection back.
     """
     if ctx.max_client is None or not ctx.max_ready.is_set():
         return
-    reason = None
-    if ctx.max_transport_connected() is False:
+    if ctx.max_transport_connected() is not False:
+        # Transport claims to be up; only a silent server can still be wrong.
+        if ctx._last_presence_update <= 0:
+            return
+        if time.time() - ctx._last_presence_update <= STUCK_THRESHOLD:
+            return
+        reason = f"no presence update for {STUCK_THRESHOLD}s"
+    else:
         reason = "transport reports the connection is closed"
-    elif ctx._last_presence_update > 0:
-        now = time.time()
-        if now - ctx._last_presence_update > STUCK_THRESHOLD:
-            reason = f"no presence update for {STUCK_THRESHOLD}s"
-    if reason is None:
-        return
-    log.warning(
-        "Watchdog: MAX connection is not usable (%s), forcing restart", reason,
-    )
+    log.warning("Watchdog: MAX connection is not usable (%s), forcing restart", reason)
+    # pymax only emits `on_disconnect` when *it* decides the connection is over;
+    # a stop we initiate unwinds `start()` through its clean-exit branch, which
+    # emits nothing. Clear max_ready here or the bridge keeps believing MAX is
+    # usable for the whole reconnect -- sending into a closed transport, and
+    # reporting MAX as up in /status. It also stops this tick from re-firing.
+    ctx.max_ready.clear()
     try:
         await ctx.max_client.stop()
     except Exception as exc:  # noqa: BLE001

@@ -335,11 +335,11 @@ class TestWatchdogTick:
 
     async def test_a_closed_transport_forces_a_restart_immediately(self):
         # The gap this closes: MAX's socket dies but pymax hasn't reported a
-        # disconnect, so max_ready still claims MAX is usable and sends fail
-        # with "Not connected to the server" -- for as long as the presence
-        # timestamp stays fresh. The transport knows it's closed, so the
-        # restart happens on the very next tick instead of up to STUCK_THRESHOLD
-        # later.
+        # disconnect, so max_ready still claims MAX is usable and every send
+        # and the presence poll fail with "Not connected to the server" -- for
+        # as long as the presence timestamp stays fresh. The transport knows
+        # it's closed, so the restart happens on the very next tick instead of
+        # up to STUCK_THRESHOLD later.
         ctx = MagicMock()
         ctx.max_client.stop = AsyncMock()
         ctx.max_ready.is_set.return_value = True
@@ -349,6 +349,40 @@ class TestWatchdogTick:
         await main_module._watchdog_tick(ctx)
 
         ctx.max_client.stop.assert_awaited_once()
+
+    async def test_a_restart_clears_max_ready_so_it_cannot_repeat(self):
+        # Regression test for a restart loop. A stop we initiate unwinds
+        # pymax's start() through its clean-exit branch, which emits no
+        # disconnect -- so nothing cleared max_ready, every tick saw the same
+        # dead-but-ready connection, and the watchdog killed pymax's reconnect
+        # over and over without ever getting a connection back.
+        ctx = make_ctx()
+        ctx.max_client.stop = AsyncMock()
+        ctx.max_transport_connected.return_value = False
+        ctx._last_presence_update = 1_000_000.0
+
+        await main_module._watchdog_tick(ctx)
+        assert not ctx.max_ready.is_set()
+
+        # The next tick must be inert: pymax needs a chance to reconnect.
+        await main_module._watchdog_tick(ctx)
+        assert ctx.max_client.stop.await_count == 1
+
+    async def test_max_ready_is_cleared_even_when_the_stale_signal_fires(self, monkeypatch):
+        # Same reasoning for the original (presence-staleness) trigger: the
+        # whole reconnect would otherwise report MAX as up in /status and keep
+        # sending into a closed transport.
+        ctx = make_ctx()
+        ctx.max_client.stop = AsyncMock()
+        ctx.max_transport_connected.return_value = True
+        now = 1_000_000.0
+        ctx._last_presence_update = now - main_module.STUCK_THRESHOLD - 1
+        monkeypatch.setattr(main_module.time, "time", lambda: now)
+
+        await main_module._watchdog_tick(ctx)
+
+        ctx.max_client.stop.assert_awaited_once()
+        assert not ctx.max_ready.is_set()
 
     async def test_an_unreadable_transport_is_not_treated_as_down(self, monkeypatch):
         # None means "no opinion" -- restarting on it would drop a healthy
