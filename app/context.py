@@ -82,6 +82,11 @@ class Context:
         # seen within this many seconds is treated as online too.
         self.STATUS_ONLINE_WINDOW = STATUS_ONLINE_WINDOW
         self._presence_poll_task: Optional[asyncio.Task] = None
+        # Retry hook for a stuck forward queue, offered after each successful
+        # presence fetch (see schedule_pending_retry). Set by main.py.
+        self.on_max_alive: Optional[Any] = None
+        self._pending_retry_task: Optional[asyncio.Task] = None
+        self._last_pending_sweep: float = 0.0
 
         # Connectivity: surface MAX (dis)connect events to the Telegram feed.
         self.max_started: bool = False
@@ -113,6 +118,34 @@ class Context:
             return bool(client._connection.transport.connected)
         except Exception:  # noqa: BLE001
             return None
+
+    def schedule_pending_retry(self) -> None:
+        """Offer MAX a chance to drain its pending-forward queue, now that we
+        know it can serve a request.
+
+        Called after every *successful* presence fetch, which is why this exists:
+        the queue is otherwise only retried on a reconnect, so a post queued
+        after a transient failure sits there indefinitely while MAX stays up
+        (and holds up every post behind it). Tying the retry to a real round
+        trip means it is never spent against a dead connection.
+
+        Runs as a task so a sweep (which can take seconds per queued post) can't
+        stall the presence feed, and is skipped if the previous one is still
+        going. `on_max_alive` is a callback rather than an import because
+        Context cannot import `app.tg_bot` (forwarding imports app.max_client,
+        which imports Context).
+        """
+        if self.on_max_alive is None:
+            return
+        if self._pending_retry_task is not None and not self._pending_retry_task.done():
+            return
+        self._pending_retry_task = asyncio.create_task(self._run_on_max_alive())
+
+    async def _run_on_max_alive(self) -> None:
+        try:
+            await self.on_max_alive(self)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("on_max_alive hook failed: %s", exc)
 
     # ---- MAX-side helpers -------------------------------------------------
     def name_for(self, chat_id, fallback: str | None = None) -> str:
@@ -315,6 +348,9 @@ class Context:
                             # stops responding, which it can't do if this is
                             # bumped regardless of whether anything happened.
                             self._last_presence_update = time.time()
+                            # ...and on the same evidence, let a stuck
+                            # forward queue be retried (throttled by the hook).
+                            self.schedule_pending_retry()
                         self._presence_dirty = True
                     last_fetch = now
                 if self._presence_dirty or now - self._presence_last_edit >= PRESENCE_EDIT_INTERVAL:

@@ -31,6 +31,10 @@ ATTEMPT_LIMIT_COOLDOWN = 300         # longer pause when MAX says "attempt limit
 STUCK_WATCHDOG_INTERVAL = 15         # check for a dead connection every 15s
 STUCK_THRESHOLD = 120                # consider stuck if no presence update for 120s
 REPLAY_POLL_INTERVAL = 30            # how often the reconnect-replay loop looks
+# Shortest gap between two sweeps of a forward queue that is stuck while MAX
+# stays up. The trigger is a successful presence poll (every 60s); this
+# throttles the actual retries, which re-download and re-upload the post.
+PENDING_RETRY_INTERVAL = 600
 # MAX doesn't push opcode 155 for messages the bridge posts into a channel, so
 # polling is the only way reactions ever reach a receipt -- not a backstop for
 # outages. Hence a tight interval, and a short first pass so a restart doesn't
@@ -151,6 +155,46 @@ async def run_replay_on_reconnect(ctx: Context) -> None:
         was_disconnected = await _reconnect_replay_tick(ctx, was_disconnected)
 
 
+async def _pending_retry(ctx: Context) -> None:
+    """`Context.schedule_pending_retry`'s hook: re-sweep a stuck forward queue.
+
+    Invoked right after a successful presence fetch, so it only ever runs when
+    MAX has just proven it can serve a request -- a retry is never spent against
+    a connection that is down, which is exactly the case
+    `replay_channel_forward` already refuses to move past.
+
+    Gated to one sweep per PENDING_RETRY_INTERVAL: presence answers every
+    PRESENCE_POLL_INTERVAL (60s), far more often than retrying is useful. Each
+    attempt re-downloads the post's media from Telegram and re-uploads it to an
+    endpoint that is demonstrably flaky, and MAX_ATTEMPTS has to stay large
+    enough that a burst of glitches can't exhaust it -- so sweeping on every
+    presence beat would turn the cap back into the data-loss bug it was meant to
+    bound.
+
+    A no-op when nothing is queued (one indexed sqlite query per channel).
+    """
+    # The presence success is what proves MAX is alive, but re-check anyway:
+    # `replay_channel_forward` bails per channel, and burning the sweep window
+    # on that would silently skip a retry that was due.
+    if ctx.max_client is None or not ctx.max_ready.is_set():
+        return
+    now = time.time()
+    if now - ctx._last_pending_sweep < PENDING_RETRY_INTERVAL:
+        return
+    ctx._last_pending_sweep = now
+    forwards = await ctx.db.alist_forwards()
+    forwarded = 0
+    for fwd in forwards:
+        tg_channel_id = fwd["tg_channel_id"]
+        try:
+            forwarded += await replay_channel_forward(ctx, tg_channel_id)
+        except Exception as exc:  # noqa: BLE001
+            log.error("Pending retry failed for channel %s: %s", tg_channel_id, exc)
+        await asyncio.sleep(1)  # rate limit
+    if forwarded:
+        log.info("Pending retry: forwarded %d queued post(s)", forwarded)
+
+
 async def _reaction_poll_tick(ctx: Context) -> int:
     """One reaction refresh pass over recently-delivered forwards.
 
@@ -246,6 +290,11 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     ctx = Context(settings=settings, bot=bot, db=db, sms=sms)
+    # A successful presence fetch is a free proof MAX can serve a request, so
+    # it's the heartbeat the stuck-queue retry hangs off. Set here (rather than
+    # imported) because Context can't import app.tg_bot: forwarding imports
+    # app.max_client, which imports Context.
+    ctx.on_max_alive = _pending_retry
 
     async def _on_sms_requested(phone: str) -> None:
         # MAX is blocked waiting for an SMS code (first login or token

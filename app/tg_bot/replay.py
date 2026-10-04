@@ -41,6 +41,21 @@ def is_max_unreachable(exc: BaseException) -> bool:
     return any(marker in text for marker in _TRANSPORT_ERROR_MARKERS)
 
 
+# How many times MAX may refuse one post before replay gives up on it and skips
+# past it. Order matters: nothing behind a broken post may go out ahead of it,
+# because delivering a channel's posts out of order is worse than delivering
+# them late -- so a refused post keeps its place at the head and is retried. The
+# cap exists only so one undeliverable post can't block its channel forever, and
+# it is deliberately enormous: MAX's upload endpoint is flaky ("Photo upload
+# URL does not contain photoIds" is a malformed *server* response, raised before
+# pymax even reads the photo bytes), so a low cap dropped posts that a later
+# attempt would have delivered -- one real post was lost that way after five
+# glitches inside half an hour. Attempts are only charged for refusals, never
+# for an unreachable MAX, so this budget is only ever spent on posts MAX is
+# actually answering "no" to.
+MAX_ATTEMPTS = 100
+
+
 def group_pending_albums(pending: list[dict]) -> list[list[dict]]:
     """Collapse consecutive queued rows that belong to the same media group.
 
@@ -65,6 +80,13 @@ def _max_attempts(group: list[dict]) -> int:
     return max(int(p.get("attempts") or 0) for p in group)
 
 
+async def _drop_group(ctx: Context, group: list[dict]) -> None:
+    """Stop queueing a post replay has given up on. Only ever called once the
+    group has burned MAX_ATTEMPTS refusals."""
+    for post in group:
+        await ctx.db.adel_pending_forward(post["id"])
+
+
 async def replay_channel_forward(ctx: Context, tg_channel_id: int) -> int:
     """Replay channel posts that were queued (in `pending_forwards`) -- either
     because MAX was down when they arrived, or because their live send failed.
@@ -80,15 +102,13 @@ async def replay_channel_forward(ctx: Context, tg_channel_id: int) -> int:
         and the pass stops. Nothing behind it could have succeeded either, and
         the post is not charged an attempt: being unable to reach MAX says
         nothing about whether MAX would take it.
-      * MAX is reachable but refused this post -- it stays queued for a later
-        retry and the pass MOVES ON to the next post, so one bad post can't hold
-        up everything behind it.
+      * MAX is reachable but refused this post -- the post keeps its place at
+        the head and is retried on the next reconnect. Order matters: the posts
+        behind it must not be delivered ahead of it.
 
-    Nothing is ever dropped: a post that keeps failing is retried on every
-    subsequent reconnect forever, with the attempt count in the log and on its
-    receipt. Dropping it would lose a post that a later retry could well have
-    delivered, which is the worse failure -- and with the queue advancing past
-    bad posts there is no longer a queue to wedge.
+    The post is only skipped (dequeued, loudly, and left marked failed on its
+    receipt) after MAX_ATTEMPTS refusals, which is the one way a channel can
+    stop making progress. The cap is huge on purpose -- see its comment.
     """
     forward = await ctx.db.aget_forward(tg_channel_id)
     if forward is None:
@@ -109,7 +129,7 @@ async def replay_channel_forward(ctx: Context, tg_channel_id: int) -> int:
     )
 
     replayed = 0
-    failed = 0
+    skipped = 0
     for group in groups:
         # The anchor is what the receipt was keyed on when the album was queued.
         anchor = group[0]
@@ -143,23 +163,40 @@ async def replay_channel_forward(ctx: Context, tg_channel_id: int) -> int:
             # MAX is up and refused this post -- e.g. its upload endpoint
             # answering with a malformed URL ("Photo upload URL does not contain
             # photoIds"), which says nothing about the photo and everything
-            # about that one request. Keep it queued for the next reconnect and
-            # move on to the posts behind it.
+            # about that one request. It keeps its place at the head and is
+            # retried on the next reconnect: the posts behind it must not be
+            # delivered ahead of it.
             attempts = _max_attempts(group) + 1
+            if attempts < MAX_ATTEMPTS:
+                log.error(
+                    "Replay: MAX refused queued post %s (%d item(s)) from channel %s "
+                    "on attempt %d/%d: %s -- keeping it queued at the head",
+                    anchor["tg_message_id"], len(group), tg_channel_id,
+                    attempts, MAX_ATTEMPTS, exc,
+                )
+                await ctx.db.abump_pending_forward_attempts([p["id"] for p in group])
+                await receipts.mark_failed(
+                    ctx, tg_channel_id, anchor["tg_message_id"],
+                    f"attempt {attempts}/{MAX_ATTEMPTS}: {exc}",
+                )
+                break
+            # Out of retries: MAX has answered "no" this many times, so treat the
+            # post as undeliverable and skip it, so the channel isn't blocked
+            # behind it forever. Logged at ERROR -- this one really is lost.
             log.error(
-                "Replay: MAX refused queued post %s (%d item(s)) from channel %s "
-                "on attempt %d: %s -- keeping it queued and moving on",
+                "Replay: skipping queued post %s (%d item(s)) from channel %s after "
+                "%d refused attempts: %s -- the posts behind it will be delivered",
                 anchor["tg_message_id"], len(group), tg_channel_id, attempts, exc,
             )
-            await ctx.db.abump_pending_forward_attempts([p["id"] for p in group])
             await receipts.mark_failed(
                 ctx, tg_channel_id, anchor["tg_message_id"],
-                f"attempt {attempts}: {exc}",
+                f"skipped after {attempts} refused attempts: {exc}",
             )
-            failed += 1
+            await _drop_group(ctx, group)
+            skipped += 1
 
     log.info(
-        "Replay: forwarded %s queued post(s) for channel %s (%d still failing)",
-        replayed, tg_channel_id, failed,
+        "Replay: forwarded %s queued post(s) for channel %s (%d skipped, %d still queued)",
+        replayed, tg_channel_id, skipped, len(pending) - replayed - skipped,
     )
     return replayed

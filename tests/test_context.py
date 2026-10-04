@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -65,6 +66,83 @@ class TestFetchPresenceMap:
         result = await ctx.fetch_presence_map()
 
         assert result is not None
+
+
+class TestSchedulePendingRetry:
+    """A stuck forward queue is only retried on a reconnect otherwise, so a post
+    queued after a transient failure sits there indefinitely while MAX stays up
+    -- and holds up every post behind it. A successful presence fetch is a free
+    proof MAX can serve a request, so that's what offers the retry."""
+
+    def test_nothing_happens_without_a_hook(self):
+        ctx = make_context()
+        ctx.on_max_alive = None
+        ctx.schedule_pending_retry()
+
+        assert ctx._pending_retry_task is None
+
+    async def test_a_successful_contact_offers_the_retry(self):
+        ctx = make_context()
+        called = []
+
+        async def hook(ctx_):
+            called.append(ctx_)
+
+        ctx.on_max_alive = hook
+        ctx.schedule_pending_retry()
+        await ctx._pending_retry_task
+
+        assert called == [ctx]
+
+    async def test_an_overlapping_sweep_is_skipped(self):
+        # A sweep can take seconds per queued post; the presence poll keeps
+        # beating every PRESENCE_POLL_INTERVAL and must not stack them up.
+        ctx = make_context()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def hook(_ctx):
+            started.set()
+            await release.wait()
+
+        ctx.on_max_alive = hook
+        ctx.schedule_pending_retry()
+        await started.wait()
+        first = ctx._pending_retry_task
+
+        ctx.schedule_pending_retry()
+
+        assert ctx._pending_retry_task is first
+        release.set()
+        await first
+
+    async def test_a_failing_hook_never_escapes(self):
+        # Nothing awaits this task, so an escaping exception would surface as
+        # asyncio's "Task exception was never retrieved" -- and worse, could
+        # kill the presence poll loop.
+        ctx = make_context()
+
+        async def hook(_ctx):
+            raise RuntimeError("db gone")
+
+        ctx.on_max_alive = hook
+        ctx.schedule_pending_retry()
+        await ctx._pending_retry_task  # must not raise
+
+    async def test_a_new_sweep_is_allowed_once_the_previous_one_finished(self):
+        ctx = make_context()
+        calls = []
+
+        async def hook(_ctx):
+            calls.append(1)
+
+        ctx.on_max_alive = hook
+        ctx.schedule_pending_retry()
+        await ctx._pending_retry_task
+        ctx.schedule_pending_retry()
+        await ctx._pending_retry_task
+
+        assert len(calls) == 2
 
 
 class TestMaxTransportConnected:

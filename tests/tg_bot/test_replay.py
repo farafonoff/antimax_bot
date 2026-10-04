@@ -175,9 +175,9 @@ async def test_an_unreachable_max_leaves_the_receipt_alone(monkeypatch):
 
 class TestReplayFailureHandling:
     """What happens to a queued post that won't send is decided by *whose* fault
-    the error is: an unreachable MAX means every post behind it would fail too
-    (so the post keeps the head of the queue), while a post MAX is up and simply
-    refused is retried but stepped over so it can't block the rest."""
+    the error is, and by order: an unreachable MAX means every post behind it
+    would fail too, and a refused post must not be overtaken -- the posts behind
+    it wait, and are only released once it has been skipped."""
 
     @staticmethod
     def spy_receipts(monkeypatch):
@@ -212,13 +212,11 @@ class TestReplayFailureHandling:
         assert result == 0
         ctx.db.adel_pending_forward.assert_not_awaited()
         ctx.db.abump_pending_forward_attempts.assert_not_awaited()
-        # The post behind it isn't even attempted: MAX is down for it too.
-        assert ctx.db.abump_pending_forward_attempts.await_count == 0
+        mark_failed.assert_not_awaited()
 
-    async def test_a_refused_post_is_retried_but_the_queue_moves_past_it(self, monkeypatch):
-        # MAX is up and answered with a malformed upload URL. That says nothing
-        # about the photo, so the post stays queued for a later retry -- but it
-        # must not hold up everything behind it.
+    async def test_a_refused_post_keeps_its_place_at_the_head(self, monkeypatch):
+        # Order matters: the post behind a refused one must not be delivered
+        # ahead of it, so it waits and the pass stops.
         ctx = make_ctx(pending=[
             make_pending(id=1, tg_message_id=11, text="flaky"),
             make_pending(id=2, tg_message_id=12, text="behind"),
@@ -226,19 +224,15 @@ class TestReplayFailureHandling:
         self.forward_failing(
             monkeypatch, "flaky", RuntimeError("Photo upload URL does not contain photoIds")
         )
-        mark_failed, mark_queued = self.spy_receipts(monkeypatch)
+        self.spy_receipts(monkeypatch)
 
         result = await replay_mod.replay_channel_forward(ctx, 123)
 
-        # The post behind it was delivered...
-        assert result == 1
-        ctx.db.adel_pending_forward.assert_any_await(2)
-        # ...while the refused one is still queued (never dequeued), charged one
-        # attempt.
-        assert [c.args[0] for c in ctx.db.adel_pending_forward.await_args_list] == [2]
+        assert result == 0
+        ctx.db.adel_pending_forward.assert_not_awaited()
         ctx.db.abump_pending_forward_attempts.assert_awaited_once_with([1])
 
-    async def test_a_refused_post_is_reported_as_failed_with_its_attempt_count(self, monkeypatch):
+    async def test_a_refused_post_is_reported_with_its_attempt_count(self, monkeypatch):
         ctx = make_ctx(pending=[
             make_pending(id=1, tg_message_id=11, text="flaky", attempts=2),
         ])
@@ -251,15 +245,16 @@ class TestReplayFailureHandling:
         mark_queued.assert_not_awaited()
         (ctx_, channel, msg_id, error) = mark_failed.await_args.args
         assert (ctx_, channel, msg_id) == (ctx, 123, 11)
-        assert "attempt 3" in error and "no photoIds" in error
+        assert "attempt 3/100" in error and "no photoIds" in error
 
-    async def test_nothing_is_ever_dropped_how_often_it_fails(self, monkeypatch):
+    async def test_a_glitchy_post_is_never_skipped_just_for_failing_often(self, monkeypatch):
         # The regression that cost a real post: MAX's upload endpoint is flaky,
-        # and an attempt budget turned five glitches into permanent data loss.
-        # With the queue advancing past bad posts there is nothing left to wedge,
-        # so a post is retried indefinitely instead of being deleted.
+        # and a low attempt cap turned a burst of glitches into permanent data
+        # loss. The cap has to stay far above any plausible glitch count.
+        assert replay_mod.MAX_ATTEMPTS >= 50
+
         ctx = make_ctx(pending=[
-            make_pending(id=1, tg_message_id=11, text="flaky", attempts=999),
+            make_pending(id=1, tg_message_id=11, text="flaky", attempts=40),
         ])
         self.forward_failing(monkeypatch, "flaky", RuntimeError("no photoIds"))
         self.spy_receipts(monkeypatch)
@@ -268,21 +263,40 @@ class TestReplayFailureHandling:
 
         ctx.db.adel_pending_forward.assert_not_awaited()
 
-    async def test_a_failed_album_stays_queued_whole_and_the_queue_moves_on(self, monkeypatch):
+    async def test_a_post_out_of_attempts_is_skipped_so_the_channel_unblocks(self, monkeypatch):
+        # MAX has answered "no" MAX_ATTEMPTS times: treat it as undeliverable
+        # rather than blocking the channel behind it forever.
+        ctx = make_ctx(pending=[
+            make_pending(id=1, tg_message_id=11, text="broken",
+                         attempts=replay_mod.MAX_ATTEMPTS - 1),
+            make_pending(id=2, tg_message_id=12, text="behind"),
+        ])
+        self.forward_failing(monkeypatch, "broken", RuntimeError("unsupported media"))
+        mark_failed, _ = self.spy_receipts(monkeypatch)
+
+        result = await replay_mod.replay_channel_forward(ctx, 123)
+
+        # Skipped, and the queue finally moves.
+        assert [c.args[0] for c in ctx.db.adel_pending_forward.await_args_list] == [1, 2]
+        assert result == 1
+        assert "skipped after" in mark_failed.await_args.args[3]
+
+    async def test_a_skipped_album_is_dropped_whole(self, monkeypatch):
         # Never half: a partial album would resend its tail as a separate post.
         ctx = make_ctx(pending=[
-            make_pending(id=1, tg_message_id=11, media_group_id="g1"),
-            make_pending(id=2, tg_message_id=12, media_group_id="g1"),
+            make_pending(id=1, tg_message_id=11, media_group_id="g1",
+                         attempts=replay_mod.MAX_ATTEMPTS - 1),
+            make_pending(id=2, tg_message_id=12, media_group_id="g1",
+                         attempts=replay_mod.MAX_ATTEMPTS - 1),
             make_pending(id=3, tg_message_id=13, text="behind"),
         ])
-        self.forward_failing(monkeypatch, "", RuntimeError("no photoIds"))
+        self.forward_failing(monkeypatch, "", RuntimeError("unsupported media"))
         self.spy_receipts(monkeypatch)
 
         result = await replay_mod.replay_channel_forward(ctx, 123)
 
+        assert [c.args[0] for c in ctx.db.adel_pending_forward.await_args_list] == [1, 2, 3]
         assert result == 1
-        assert ctx.db.adel_pending_forward.await_count == 1
-        assert ctx.db.adel_pending_forward.await_args.args[0] == 3
 
     async def test_a_failed_album_is_charged_as_one_group(self, monkeypatch):
         ctx = make_ctx(pending=[

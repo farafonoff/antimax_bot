@@ -7,6 +7,7 @@ helper (`_run_max_cycle`, `_reconnect_replay_tick`, `_watchdog_tick`); these
 tests drive the helpers directly instead of fighting the infinite loops.
 """
 import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -497,3 +498,100 @@ class TestRunReactionPoll:
         # Guards the constants themselves: swapping them would silently undo
         # the point of the first pass.
         assert main_module.REACTION_POLL_FIRST_DELAY < main_module.REACTION_POLL_INTERVAL
+
+
+class TestPendingRetry:
+    """main._pending_retry: the hook `Context.schedule_pending_retry` invokes
+    after a successful presence poll. Without it a stuck forward queue is only
+    ever retried on a reconnect, so a post queued after a transient failure
+    waits indefinitely (and holds up everything behind it) while MAX stays up."""
+
+    def make_sweep_ctx(self):
+        ctx = make_ctx()
+        ctx._last_pending_sweep = 0.0
+        ctx.db.alist_forwards = AsyncMock(return_value=[{"tg_channel_id": 1}])
+        return ctx
+
+    async def test_a_sweep_drains_every_configured_forward(self, monkeypatch):
+        ctx = self.make_sweep_ctx()
+        replayed = []
+
+        async def fake_replay(_ctx, tg_channel_id):
+            replayed.append(tg_channel_id)
+            return 2
+
+        monkeypatch.setattr(main_module, "replay_channel_forward", fake_replay)
+        monkeypatch.setattr(main_module.asyncio, "sleep", AsyncMock())
+
+        await main_module._pending_retry(ctx)
+
+        assert replayed == [1]
+
+    async def test_max_not_ready_is_a_no_op(self, monkeypatch):
+        ctx = self.make_sweep_ctx()
+        ctx.max_ready.clear()
+        replay = AsyncMock()
+        monkeypatch.setattr(main_module, "replay_channel_forward", replay)
+
+        await main_module._pending_retry(ctx)
+
+        replay.assert_not_awaited()
+
+    async def test_presence_beats_are_throttled(self, monkeypatch):
+        # Presence answers every PRESENCE_POLL_INTERVAL (60s). Sweeping on each
+        # one would retry ~10x more often than PENDING_RETRY_INTERVAL, and each
+        # attempt re-downloads and re-uploads the post -- which is how a flaky
+        # endpoint burns MAX_ATTEMPTS.
+        ctx = self.make_sweep_ctx()
+        ctx._last_pending_sweep = time.time()
+        replay = AsyncMock()
+        monkeypatch.setattr(main_module, "replay_channel_forward", replay)
+
+        await main_module._pending_retry(ctx)
+
+        replay.assert_not_awaited()
+
+    async def test_a_sweep_runs_once_the_interval_has_passed(self, monkeypatch):
+        ctx = self.make_sweep_ctx()
+        ctx._last_pending_sweep = time.time() - main_module.PENDING_RETRY_INTERVAL - 1
+        replay = AsyncMock(return_value=0)
+        monkeypatch.setattr(main_module, "replay_channel_forward", replay)
+        monkeypatch.setattr(main_module.asyncio, "sleep", AsyncMock())
+
+        await main_module._pending_retry(ctx)
+
+        replay.assert_awaited_once_with(ctx, 1)
+        # ...and the clock restarts, so the next beat doesn't sweep again.
+        assert ctx._last_pending_sweep > 0
+
+    async def test_one_failing_channel_does_not_stop_the_others(self, monkeypatch):
+        ctx = make_ctx()
+        ctx._last_pending_sweep = 0.0
+        ctx.db.alist_forwards = AsyncMock(
+            return_value=[{"tg_channel_id": 1}, {"tg_channel_id": 2}]
+        )
+        seen = []
+
+        async def fake_replay(_ctx, tg_channel_id):
+            seen.append(tg_channel_id)
+            if tg_channel_id == 1:
+                raise RuntimeError("boom")
+
+        monkeypatch.setattr(main_module, "replay_channel_forward", fake_replay)
+        monkeypatch.setattr(main_module.asyncio, "sleep", AsyncMock())
+
+        await main_module._pending_retry(ctx)  # must not raise
+
+        assert seen == [1, 2]
+
+    async def test_the_first_sweep_after_startup_is_not_throttled_away(self, monkeypatch):
+        # ctx._last_pending_sweep starts at 0, so the first presence success
+        # drains a queue that survived a restart.
+        ctx = self.make_sweep_ctx()
+        replay = AsyncMock(return_value=0)
+        monkeypatch.setattr(main_module, "replay_channel_forward", replay)
+        monkeypatch.setattr(main_module.asyncio, "sleep", AsyncMock())
+
+        await main_module._pending_retry(ctx)
+
+        replay.assert_awaited_once()
