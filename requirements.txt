@@ -1,4 +1,11 @@
-maxapi-python>=2.4
+# maxapi-python ships as `pymax` on import.
+#
+# Pinned to our fork until the photo-upload fix lands upstream: MAX stopped
+# returning a `photoIds` parameter on the photo upload URL, which made every
+# photo upload fail ("Photo upload URL does not contain photoIds"). The fix is
+# MaxApiTeam/PyMax!fix/photo-upload-index-token -- switch this line back to
+# `maxapi-python>=2.4.1` once a release includes it, and nothing else changes.
+maxapi-python @ git+https://github.com/farafonoff/PyMax@fix/photo-upload-index-token
 aiogram>=3.5
 python-dotenv>=1.0
 # Rendering the MAX login QR code as a PNG (qrcode alone needs Pillow for this).
